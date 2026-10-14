@@ -1,0 +1,46 @@
+# lite_dyid 默认参数
+#
+# ⚠️ 本包**不使用** ROS 参数系统（节点是普通 rclpy 节点 + argparse），
+#    这个文件只是"默认值的单一来源"，由 lite_dyid.collect.load_defaults() 读取。
+#    命令行参数（含 launch 传的）优先级更高。
+#
+# 前置：先起 CSP 组的 bringup，并授权本包的数据源
+#     ros2 launch lite_bringup lite_bringup.launch.py \
+#         mode:=arms controller:=csp control_mode:=csp source_names:=dyid
+lite_dyid:
+  ros__parameters:
+    # --- 通路 ---
+    source: dyid                 # 必须出现在 bringup 的 source_names 里
+    publish_rate_hz: 100.0       # 下发频率；控制器 100 Hz 写 loc_ref
+    command_timeout_ms: 300.0    # MotionCommand.timeout_ms（桥看门狗）
+
+    # --- 轨迹与限速 ---
+    speed_cap: 0.15              # 目标峰值速度 rad/s（设计值 ≈0.13）
+    return_speed: 0.12           # 回起始姿态的速度上限 rad/s
+
+    # --- 小幅运动验证（每关节，不碰限位）---
+    small_delta_rad: 0.15        # 8.6°，远小于用户要求的 15°
+    small_speed: 0.10            # rad/s
+    small_hold_sec: 1.5          # 到位后停留，等稳态
+    small_reach_ratio: 0.5       # 实动 ≥ 50% 命令幅度才算"命令真的到位"
+    small_tolerance_rad: 0.25    # 稳态误差上限（≈14°）
+
+    # --- 辨识 ---
+    # ⚠️ 求解前先对 cmd/q/v/tau 做**零相位**低通（同一个滤波器、同一带宽）。
+    #    本机轨迹成分最高 0.14 Hz（基频 0.035 Hz × 4 次谐波），0.2 Hz 是
+    #    "能保住运动本身"的最低带宽；再低就开始削信号而不是噪声。
+    #    设 0 = 不滤波（残差里会混进测量噪声与高频未建模效应）。
+    lpf_hz: 0.2
+    # 并行进程数（os.fork + 管道，worker 只回传几十 KB 的法方程）。
+    # 1 = 串行。若在 ROS 节点内遇到 fork 相关的异常，把它设回 1。
+    workers: 4
+    # 求解用的模型：默认**只做「静态 + 摩擦」**（每样本不调 regressor，最快）。
+    # 设 true 才额外辨识 108 个惯量分量（模型 C/D）—— 实测本工况下不改善验证残差，
+    # 见 README「可选：静态 + 摩擦 + 惯性」。
+    with_inertia: false
+    # 惯性回归用哪种加速度：ref = 参考轨迹二阶导（推荐）/ meas = 实测速度一阶导
+    accel: ref
+    ridge: 0.000001              # 岭系数（只作用于不可辨识方向）
+
+    # --- 校核 ---
+    collision_samples: 400       # 轨迹 mesh 碰撞检查的采样点数

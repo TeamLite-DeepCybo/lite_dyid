@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>lite_dyid</name>
+  <version>0.1.0</version>
+  <description>
+    Lite 双臂动力学辨识（CSP 位置模式）：
+    傅里叶激励轨迹 + 插入静止段 → 重力(质量/质心)辨识 → 摩擦(c1±,c2)辨识 → 第三条轨迹验证与残差可视化。
+    本包**只当数据源**，不改动 lite_bridge / lite_controller / lite_driver。
+  </description>
+  <maintainer email="marki@example.com">marki</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>robstride_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>lite_bringup</exec_depend>
+  <!--
+    ⚠️ pinocchio 不是 rosdep key，需手工安装（本机已验证 4.0.0 可用）：
+        apt:  sudo apt install robotpkg-py3*-pinocchio   （视源而定）
+        pip:  /usr/bin/python3 -m pip install pin
+    碰撞检测还需要 hppfcl（pinocchio 的依赖，随 pin 一起装）。
+  -->
+
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
