@@ -187,7 +187,9 @@ ros2 run lite_dyid dyid_tracking_validate \
 
 输出目录位于辨识结果下的 `tracking_validation_<时间>/`，包含两组原始 CSV、两张
 实际/期望关节角度图、逐关节误差对比图、`tracking_error_stats.csv` 和
-`summary.json`。运行前会校验 URDF 哈希、限位、速度、mesh 碰撞和前馈额定力矩。
+`summary.json`。运行前会校验 URDF 机械语义、限位、速度、mesh 碰撞和前馈额定力矩。
+其中在线 URDF 采用 XML 语义校验：允许验证所必需的 `control_mode: csp→mit`
+变化及纯格式差异，关节、限位、传动、惯性或几何变化仍会拒绝。
 
 ---
 

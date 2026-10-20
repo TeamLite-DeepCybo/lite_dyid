@@ -6,10 +6,11 @@ import numpy as np
 import pytest
 
 from lite_dyid.common import (CSP_MONITOR, MIT_HOLD, MIT_TRACKING,
-                              PROTOCOL_CSP, PROTOCOL_MIT)
+                              PROTOCOL_CSP, PROTOCOL_MIT, DyidError)
 from lite_dyid.csp_client import BridgeClient, ProtocolRestartRequired
 from lite_dyid.report import tracking_error_stats
 from lite_dyid.tracking_validate import (build_validation_trajectory,
+                                         check_live_urdf_compatible,
                                          find_latest_run, sample_reference)
 
 
@@ -142,3 +143,32 @@ def test_find_latest_run_accepts_an_explicit_result(tmp_path):
     (explicit / "params.json").write_text("{}")
     (explicit / "robot.urdf").write_text("<robot/>")
     assert find_latest_run(explicit) == explicit.resolve()
+
+
+def test_live_urdf_accepts_only_expected_csp_to_mit_change():
+    template = """<robot name="lite">
+      <ros2_control name="left" type="system"><hardware>
+        <plugin>lite_driver/LiteSystem</plugin><param name="control_mode">{mode}</param>
+      </hardware></ros2_control>
+      <joint name="j" type="revolute"><limit lower="-1" upper="1"/></joint>
+    </robot>"""
+    message = check_live_urdf_compatible(template.format(mode="csp"),
+                                         template.format(mode="mit"))
+    assert "机械模型一致" in message
+
+
+def test_live_urdf_rejects_joint_limit_change_even_when_protocol_changes():
+    reference = """<robot><ros2_control><hardware>
+      <param name="control_mode">csp</param></hardware></ros2_control>
+      <joint name="j"><limit lower="-1" upper="1"/></joint></robot>"""
+    live = """<robot><ros2_control><hardware>
+      <param name="control_mode">mit</param></hardware></ros2_control>
+      <joint name="j"><limit lower="-2" upper="1"/></joint></robot>"""
+    with pytest.raises(DyidError, match="机械模型差异"):
+        check_live_urdf_compatible(reference, live)
+
+
+def test_live_urdf_ignores_xml_whitespace_only():
+    assert "语义一致" in check_live_urdf_compatible(
+        '<robot name="lite"><link name="base"/></robot>',
+        '<robot name="lite">\n  <link name="base" />\n</robot>')

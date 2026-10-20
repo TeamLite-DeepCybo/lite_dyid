@@ -11,6 +11,7 @@ import json
 import math
 import sys
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -79,6 +80,47 @@ def find_latest_run(run_dir: Optional[Path] = None) -> Path:
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _urdf_semantic_digest(urdf_text: str, *, ignore_control_mode: bool) -> str:
+    """计算 URDF XML 的语义摘要，可只忽略驱动启动协议字段。
+
+    辨识在 CSP 下采集，而跟踪验证必须在 MIT 下运行；xacro 因此必然把两个
+    ``ros2_control/hardware/param[@name='control_mode']`` 从 ``csp`` 改为
+    ``mit``。该字段只选择底层通信协议，不改变关节、限位、传动、惯性或 mesh，
+    不能作为拒绝使用同一辨识模型的理由。
+    """
+    try:
+        root = ET.fromstring(urdf_text)
+    except ET.ParseError as exc:
+        raise DyidError(f"robot_description 不是合法 XML：{exc}") from exc
+
+    def encode(element: ET.Element, path: Tuple[str, ...]):
+        text = " ".join((element.text or "").split())
+        here = path + (element.tag,)
+        if (ignore_control_mode and element.tag == "param"
+                and element.attrib.get("name") == "control_mode"
+                and len(path) >= 2 and path[-2:] == ("ros2_control", "hardware")):
+            text = "<runtime-protocol>"
+        return (element.tag, tuple(sorted(element.attrib.items())), text,
+                tuple(encode(child, here) for child in list(element)))
+
+    payload = repr(encode(root, tuple())).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def check_live_urdf_compatible(reference: str, live: str) -> str:
+    """验证 live URDF 是否只含格式差异或预期的 CSP→MIT 协议差异。"""
+    if _urdf_semantic_digest(reference, ignore_control_mode=False) == \
+            _urdf_semantic_digest(live, ignore_control_mode=False):
+        return "当前 URDF 与辨识 URDF 语义一致"
+    if _urdf_semantic_digest(reference, ignore_control_mode=True) == \
+            _urdf_semantic_digest(live, ignore_control_mode=True):
+        return "当前 URDF 仅 control_mode 由 CSP 变为 MIT；机械模型一致"
+    raise DyidError(
+        "当前 /robot_description 与辨识时 URDF 存在机械模型差异"
+        "（关节/限位/传动/惯性/几何等），拒绝套用旧参数；"
+        "允许的差异仅为 XML 格式和 ros2_control.hardware.control_mode 的 CSP→MIT 切换")
 
 
 def validate_params(params: dict, urdf_text: str) -> None:
@@ -319,8 +361,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         client.wait_joint_states(timeout=25.0)
         live_urdf = client.wait_urdf(timeout=20.0)
-        if _sha256(live_urdf) != _sha256(run_urdf):
-            raise DyidError("当前 /robot_description 与辨识时 robot.urdf 不一致，拒绝套用旧参数")
+        print(f"[预检] {check_live_urdf_compatible(run_urdf, live_urdf)}")
         client.assert_healthy()
 
         # 若仍在 CSP，此调用只执行 CSP_MONITOR 回退并要求重启，不会发布 MIT。
