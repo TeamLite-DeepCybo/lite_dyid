@@ -54,6 +54,8 @@ class _TinyModel:
                         for n in self.model.names[1:]}
         self.joints = list(self.v_index)
         self.link_names = list(self.joints)
+        self.link_joints = list(range(1, self.model.njoints))
+        self.arm_v = [self.v_index[name] for name in self.joints]
         self.n_params = 4 * len(self.joints)
 
     def q_from_list(self, vals):
@@ -175,6 +177,18 @@ def test_predict_torque_matches_generator():
     pred = predict_torque(model, params, q, v)
     tg = model.gravity_torque(model.q_from_list(q), np.asarray(params["gravity"]["params"]))
     assert np.allclose(pred, tg + np.array([0.1, -0.2]) + np.array([0.3, 0.4]) * v)
+
+
+def test_fast_gravity_evaluator_exactly_matches_saved_parameter_semantics():
+    """实时前馈优化必须逐值复现原回归基，不能按常见参数格式误解旧结果。"""
+    from lite_dyid.model import RobotModel
+
+    model = _TinyModel()
+    params = model.nominal_arm_params()
+    fast = RobotModel.fast_gravity_evaluator(model, params)
+    for values in (np.array([0.3, -0.7]), np.array([-1.1, -0.2]), np.zeros(2)):
+        q = model.q_from_list(values)
+        assert np.allclose(fast(q), model.gravity_torque(q, params), atol=1e-12)
 
 
 def test_read_table_rejects_ragged_rows(tmp_path):

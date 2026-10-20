@@ -1,7 +1,7 @@
 # Copyright (c) 2026
 # Licensed under the Apache License, Version 2.0
 
-"""与 lite_bridge 的唯一出口：状态查询、模式切换、CSP 位置命令。
+"""与 lite_bridge 的唯一出口：状态查询、模式切换、CSP/MIT 命令。
 
 信息通路（本包**只当数据源**，不改动任何底层包）
 ================================================
@@ -40,7 +40,11 @@ from .common import (
     CSP_MONITOR,
     CSP_TRACKING,
     MODE_CSP,
+    MODE_MIT,
+    MIT_HOLD,
+    MIT_TRACKING,
     PROTOCOL_CSP,
+    PROTOCOL_MIT,
     PROTOCOL_KEEP,
     SAFETY_FAULT,
     SRV_CLEAR_FAULT,
@@ -65,6 +69,10 @@ class JointSnapshot:
 
     def age(self) -> float:
         return time.monotonic() - self.stamp
+
+
+class ProtocolRestartRequired(DyidError):
+    """当前是另一种驱动协议；已回安全档，必须重启 bringup。"""
 
 
 class BridgeClient:
@@ -377,6 +385,42 @@ class BridgeClient:
 
         return "；".join(notes)
 
+    def finish_mit_session(self, *, entered_tracking: bool,
+                           held_position: Optional[Sequence[float]] = None,
+                           kp: float = 15.0, kd: float = 3.0) -> str:
+        """MIT 验证收尾：先回 HOLD，再停发，最后解除源锁。
+
+        MIT tracking 的陈旧策略是 passive。若像 CSP 那样先停发并等待，机械臂会
+        在 HOLD 接管前失去阻抗力矩。因此 MIT 的安全顺序必须是：保持当前目标持续
+        出流 → TRACKING 切 HOLD → 停发 → AUTO。
+        """
+        notes: List[str] = []
+        if entered_tracking:
+            try:
+                if held_position is not None:
+                    q = np.asarray(held_position, dtype=float)
+                    self.publish_mit(q, np.zeros_like(q), np.zeros_like(q), kp=kp, kd=kd)
+                res = self.set_mode(PROTOCOL_KEEP, MIT_HOLD, timeout=15.0)
+                notes.append(
+                    f"① set_mode(MIT_HOLD) ok={getattr(res, 'ok', None)} "
+                    f"actual_mode={getattr(res, 'actual_mode', '?')}"
+                    f"（{getattr(res, 'actual_mode_name', '')}）")
+            except Exception as exc:
+                notes.append(f"① 切 MIT_HOLD 失败：{exc}")
+        else:
+            notes.append("① 未进入过 MIT_TRACKING，不切模式")
+        try:
+            self.node.destroy_publisher(self.pub)
+            notes.append("② 已停止下发 MotionCommand")
+        except Exception as exc:
+            notes.append(f"② 停发时异常（忽略）：{exc}")
+        try:
+            res = self.set_source_auto(timeout=10.0)
+            notes.append(f"③ set_source(AUTO) ok={getattr(res, 'ok', None)}")
+        except Exception as exc:
+            notes.append(f"③ 解除数据源干预失败：{exc}")
+        return "；".join(notes)
+
     # -- 模式：确保 CSP + TRACKING ---------------------------------------
 
     def ensure_csp_ready(self, *, force_enter_tracking: bool = True) -> str:
@@ -487,6 +531,103 @@ class BridgeClient:
             notes.append("已进 CSP_TRACKING，二次回读确认控制器 active")
         return "；".join(notes)
 
+    def ensure_mit_ready(self, *, kp: float = 15.0, kd: float = 3.0,
+                         force_enter_tracking: bool = True) -> str:
+        """确认 MIT 协议并按 HOLD → 锁源 → TRACKING 进入验证状态。
+
+        若当前是 CSP，先切 ``CSP_MONITOR`` 使电机失能，再抛出
+        :class:`ProtocolRestartRequired`。跨协议是驱动启动期操作，调用者应按异常
+        里的参数重启 bringup 后重新运行；本方法不会伪装成已经切换成功。
+        """
+        st = self.get_status()
+        if not getattr(st, "ok", False):
+            raise DyidError(f"读取桥状态失败：{getattr(st, 'message', '')}")
+        notes = [f"当前：protocol={st.protocol_name} mode={st.mode_name}({st.mode}) "
+                 f"controller={st.active_controller}[{'active' if st.controller_active else 'inactive'}]"]
+
+        if st.protocol == PROTOCOL_CSP:
+            res = self.set_mode(PROTOCOL_KEEP, CSP_MONITOR, timeout=15.0)
+            if (not getattr(res, "ok", False)
+                    or getattr(res, "actual_protocol", None) != PROTOCOL_CSP
+                    or getattr(res, "actual_mode", None) != CSP_MONITOR
+                    or not getattr(res, "controller_active", False)):
+                raise DyidError(
+                    "检测到 CSP，但回退 CSP_MONITOR 失败："
+                    f"{getattr(res, 'message', '')}；为避免跨协议误下发，本次终止")
+            try:
+                self.set_source_auto(timeout=10.0)
+            except Exception:
+                pass
+            required = "controller:=modes control_mode:=mit"
+            raise ProtocolRestartRequired(
+                "检测到当前底层为 CSP；已切到 CSP_MONITOR（电机失能），且没有下发 "
+                "MIT 命令。MIT/CSP 运行中不可跨协议切换。请停止当前 bringup 后用以下"
+                "参数重启：\n"
+                f"    {required} source_names:={self.source}\n"
+                "随后重新运行 dyid_tracking_validate。")
+        if st.protocol != PROTOCOL_MIT:
+            raise DyidError(f"桥返回未知协议 {st.protocol}（{st.protocol_name}）")
+        if not (st.zero_torque_loaded and st.hold_loaded and st.tracking_loaded):
+            raise DyidError("MIT 控制器未全部加载（需要 zero_torque / hold / tracking）")
+
+        if st.mode != MIT_HOLD or not st.controller_active:
+            res = self.set_mode(PROTOCOL_KEEP, MIT_HOLD)
+            if (not getattr(res, "ok", False)
+                    or getattr(res, "actual_protocol", None) != PROTOCOL_MIT
+                    or getattr(res, "actual_mode", None) != MIT_HOLD
+                    or not getattr(res, "controller_active", False)):
+                raise DyidError(
+                    "切 MIT_HOLD 后回读不一致："
+                    f"ok={getattr(res, 'ok', False)} "
+                    f"protocol={getattr(res, 'actual_protocol_name', '?')} "
+                    f"mode={getattr(res, 'actual_mode_name', '?')} "
+                    f"controller_active={getattr(res, 'controller_active', False)}；"
+                    f"桥的回复：{getattr(res, 'message', '')}")
+            notes.append("已切 MIT_HOLD 并确认 active")
+        else:
+            notes.append("启动时已在 MIT_HOLD，控制器 active")
+
+        q_hold = np.asarray(list(self.pose_dict().values()), dtype=float)
+        zeros = np.zeros(len(ARM_JOINTS), dtype=float)
+        for _ in range(6):
+            self.publish_mit(q_hold, zeros, zeros, kp=kp, kd=kd)
+            time.sleep(0.03)
+        lk = self.lock_source(timeout=10.0)
+        if (not getattr(lk, "ok", False)
+                or not getattr(lk, "source_online", False)
+                or getattr(lk, "active_source", "") != self.source):
+            raise DyidError(
+                f"MIT 验证锁源失败：{getattr(lk, 'message', '')}；"
+                f"active_source='{getattr(lk, 'active_source', '')}'")
+        notes.append(f"已锁定数据源 '{self.source}'（MODE_LOCK）")
+
+        if force_enter_tracking:
+            res = self.set_mode(PROTOCOL_KEEP, MIT_TRACKING)
+            if (not getattr(res, "ok", False)
+                    or getattr(res, "actual_protocol", None) != PROTOCOL_MIT
+                    or getattr(res, "actual_mode", None) != MIT_TRACKING
+                    or not getattr(res, "controller_active", False)):
+                raise DyidError(
+                    "切 MIT_TRACKING 后回读不一致："
+                    f"ok={getattr(res, 'ok', False)} "
+                    f"protocol={getattr(res, 'actual_protocol_name', '?')} "
+                    f"mode={getattr(res, 'actual_mode_name', '?')} "
+                    f"controller_active={getattr(res, 'controller_active', False)}；"
+                    f"桥的回复：{getattr(res, 'message', '')}")
+            verify = self.get_status()
+            if (not getattr(verify, "ok", False)
+                    or verify.protocol != PROTOCOL_MIT
+                    or verify.mode != MIT_TRACKING
+                    or not verify.controller_active):
+                raise DyidError(
+                    "MIT_TRACKING 二次状态确认失败："
+                    f"protocol={getattr(verify, 'protocol_name', '?')} "
+                    f"mode={getattr(verify, 'mode_name', '?')} "
+                    f"controller={getattr(verify, 'active_controller', '?')} "
+                    f"active={getattr(verify, 'controller_active', False)}")
+            notes.append("已进 MIT_TRACKING，二次回读确认控制器 active")
+        return "；".join(notes)
+
     def assert_healthy(self) -> None:
         level, flags, src = self.safety()
         if level >= SAFETY_FAULT:
@@ -510,6 +651,33 @@ class BridgeClient:
         msg.timeout_ms = self.command_timeout_ms
         msg.joint_names = list(ARM_JOINTS)
         msg.position = [float(x) for x in q]
+        self.pub.publish(msg)
+
+    def publish_mit(self, q: Sequence[float], v: Sequence[float],
+                    tau_ff: Sequence[float], *, kp: float = 15.0,
+                    kd: float = 3.0) -> None:
+        """发布一帧完整 14 关节 MIT 五字段命令。"""
+        arrays = [np.asarray(x, dtype=float).reshape(-1) for x in (q, v, tau_ff)]
+        labels = ("position", "velocity", "effort")
+        for label, arr in zip(labels, arrays):
+            if arr.size != len(ARM_JOINTS):
+                raise DyidError(f"{label} 长度 {arr.size} != {len(ARM_JOINTS)}")
+            if not np.all(np.isfinite(arr)):
+                raise DyidError(f"{label} 含 NaN/Inf")
+        if not (np.isfinite(kp) and np.isfinite(kd) and 0.0 <= kp <= 500.0
+                and 0.0 <= kd <= 5.0):
+            raise DyidError(f"MIT 增益越界：Kp={kp}, Kd={kd}")
+        msg = self._MotionCommand()
+        msg.header.stamp = self.node.get_clock().now().to_msg()
+        msg.source = self.source
+        msg.mode = MODE_MIT
+        msg.timeout_ms = self.command_timeout_ms
+        msg.joint_names = list(ARM_JOINTS)
+        msg.position = [float(x) for x in arrays[0]]
+        msg.velocity = [float(x) for x in arrays[1]]
+        msg.effort = [float(x) for x in arrays[2]]
+        msg.kp = [float(kp)] * len(ARM_JOINTS)
+        msg.kd = [float(kd)] * len(ARM_JOINTS)
         self.pub.publish(msg)
 
     def publish_hold(self, positions: Sequence[float]) -> None:

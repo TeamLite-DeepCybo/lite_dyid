@@ -130,6 +130,99 @@ def write_stats_csv(path: Path, rows: Sequence[Dict[str, float]]) -> None:
             w.writerow(r)
 
 
+def tracking_error_stats(error: np.ndarray, *, condition: str = "") -> List[Dict[str, float]]:
+    """逐关节角度跟踪误差统计，同时给出 rad 与 degree。"""
+    error = np.asarray(error, dtype=float)
+    if error.ndim != 2 or error.shape[1] != len(ARM_JOINTS):
+        raise ValueError(f"error 形状应为 (n,{len(ARM_JOINTS)})，得到 {error.shape}")
+    rows: List[Dict[str, float]] = []
+    for j, joint in enumerate(ARM_JOINTS):
+        values = error[:, j]
+        values = values[np.isfinite(values)]
+        row: Dict[str, float] = {"condition": condition, "joint": joint}
+        if not values.size:
+            rows.append(row)
+            continue
+        abs_values = np.abs(values)
+        mean = float(np.mean(values))
+        std = float(np.std(values))
+        mae = float(np.mean(abs_values))
+        rmse = float(np.sqrt(np.mean(values ** 2)))
+        p95 = float(np.percentile(abs_values, 95))
+        maximum = float(np.max(abs_values))
+        row.update({
+            "n": int(values.size),
+            "mean_rad": mean, "std_rad": std, "mae_rad": mae,
+            "rmse_rad": rmse, "p95_abs_rad": p95, "max_abs_rad": maximum,
+            "mean_deg": float(np.degrees(mean)), "std_deg": float(np.degrees(std)),
+            "mae_deg": float(np.degrees(mae)), "rmse_deg": float(np.degrees(rmse)),
+            "p95_abs_deg": float(np.degrees(p95)),
+            "max_abs_deg": float(np.degrees(maximum)),
+        })
+        rows.append(row)
+    return rows
+
+
+def plot_tracking_trial(out_dir: Path, condition: str, time_sec: np.ndarray,
+                        q_des: np.ndarray, q_actual: np.ndarray) -> Path:
+    """画 14 关节实际角度与期望角度时序。"""
+    plt = _plt()
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    error = np.asarray(q_actual) - np.asarray(q_des)
+    _, fig, axes = _grid(14, 2)
+    for j, joint in enumerate(ARM_JOINTS):
+        ax = axes[j]
+        ax.plot(time_sec, np.degrees(q_des[:, j]), lw=0.8,
+                color="tab:orange", label="desired")
+        ax.plot(time_sec, np.degrees(q_actual[:, j]), lw=0.75,
+                color="tab:blue", label="actual", alpha=0.9)
+        rmse = np.degrees(np.sqrt(np.mean(error[:, j] ** 2)))
+        ax.set_title(f"{joint}  RMSE={rmse:.3f} deg", fontsize=8)
+        ax.set_ylabel("deg", fontsize=7)
+        ax.tick_params(labelsize=7)
+        ax.grid(alpha=0.3)
+        if j == 0:
+            ax.legend(fontsize=7)
+    fig.suptitle(f"MIT tracking ({condition}): desired vs actual joint angle", fontsize=11)
+    fig.tight_layout()
+    path = out_dir / f"tracking_{condition}.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
+def plot_tracking_comparison(out_dir: Path,
+                             stats_by_condition: Dict[str, Sequence[Dict[str, float]]]) -> Path:
+    """并排比较两种条件下的逐关节 RMSE / MAE / 最大绝对误差。"""
+    plt = _plt()
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    conditions = list(stats_by_condition)
+    x = np.arange(len(ARM_JOINTS), dtype=float)
+    width = 0.8 / max(1, len(conditions))
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    metrics = (("rmse_deg", "RMSE (deg)"), ("mae_deg", "MAE (deg)"),
+               ("max_abs_deg", "Max abs error (deg)"))
+    for cidx, condition in enumerate(conditions):
+        rows = stats_by_condition[condition]
+        offset = (cidx - 0.5 * (len(conditions) - 1)) * width
+        for ax, (key, ylabel) in zip(axes, metrics):
+            values = [float(row.get(key, np.nan)) for row in rows]
+            ax.bar(x + offset, values, width=width, label=condition)
+            ax.set_ylabel(ylabel)
+            ax.grid(alpha=0.3, axis="y")
+    axes[0].legend()
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels(ARM_JOINTS, rotation=60, ha="right", fontsize=7)
+    fig.suptitle("MIT tracking error: identified feedforward comparison")
+    fig.tight_layout()
+    path = out_dir / "tracking_error_comparison.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
 def plot_training(run_dir: Path, model, grav, fric) -> Path:
     """训练集自检：静止样本 τ_meas vs τ_grav，以及摩擦拟合残差。"""
     from .dataset import joint_matrix, read_table

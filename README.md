@@ -153,6 +153,7 @@ source install/setup.bash
 | `dyid_design --generate <path>` | 重新生成轨迹定义（固定种子，可复现） |
 | `dyid_identify --run-dir <dir>` | 离线重解（只读 CSV）；默认 `--lpf 0.2 --workers 4` |
 | `dyid_validate --run-dir <dir>` | 离线重出验证残差与图 |
+| `dyid_tracking_validate [--run-dir <dir>]` | MIT 真机 A/B 跟踪验证：无辨识前馈 vs 重力+摩擦前馈 |
 | `--legacy` | 用旧实现（`lsq_linear` 大矩阵）做交叉对照 |
 
 ```bash
@@ -161,6 +162,32 @@ ros2 run lite_dyid dyid_identify --run-dir <采集目录> --with-inertia    # �
 ros2 run lite_dyid dyid_validate --run-dir <采集目录> --workers 16
 ros2 run lite_dyid dyid_identify --run-dir <采集目录> --legacy          # 交叉对照
 ```
+
+### 3.3 MIT 跟踪误差 A/B 验证
+
+该入口自动选择最新一次含 `params.json` 与 `robot.urdf` 的辨识目录，也可以用
+`--run-dir` 固定结果。两组均使用 `Kp=15, Kd=3` 和完全相同的 14 关节傅里叶轨迹；
+频率为 `0.025/0.05 Hz`（倍率 2），每组默认 120 s。第一组前馈力矩为零，第二组
+使用最新辨识的 `gravity(q_des)+friction(v_des)`。
+
+若当前 bringup 是 CSP，第一次运行只会检测状态并切回 `CSP_MONITOR`，然后退出并
+打印 MIT 重启参数。协议不能在运行中切换，因此按提示重启后再次运行同一命令：
+
+```bash
+ros2 run lite_dyid dyid_tracking_validate
+
+# 若上一步提示当前为 CSP，停止 bringup 后重启：
+ros2 launch lite_bringup lite_bringup.launch.py \
+    mode:=arms controller:=modes control_mode:=mit source_names:=dyid
+
+# MIT bringup 就绪后再次运行；也可显式指定辨识目录
+ros2 run lite_dyid dyid_tracking_validate \
+    --run-dir /tmp/dyid_runs/run_YYYYmmdd_HHMMSS
+```
+
+输出目录位于辨识结果下的 `tracking_validation_<时间>/`，包含两组原始 CSV、两张
+实际/期望关节角度图、逐关节误差对比图、`tracking_error_stats.csv` 和
+`summary.json`。运行前会校验 URDF 哈希、限位、速度、mesh 碰撞和前馈额定力矩。
 
 ---
 
@@ -397,6 +424,7 @@ src/lite_dyid/
 │   ├── collect.py       主流程（预检 → 采集 → 解算 → 询问）
 │   ├── identify.py      重力 + 摩擦辨识 + 离线 CLI
 │   ├── validate.py      可选外部验证数据的残差
+│   ├── tracking_validate.py  MIT 两频轨迹的无/有辨识前馈跟踪对比
 │   ├── report.py        可视化（Agg，字体，缓存目录自动回退）
 │   └── design.py        轨迹设计/校核工具
 ├── config/              dyid.yaml（默认参数）、trajectories.yaml（唯一交付轨迹）

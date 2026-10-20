@@ -94,6 +94,11 @@ CSP_MONITOR = 5    # 只读，不使能（电机自由）
 CSP_HOLD = 6       # 使能，锁在进档姿态
 CSP_TRACKING = 7   # 使能，跟随命令
 
+#: SetMode.mode（MIT 组）
+MIT_ZERO_TORQUE = 0  # 零力矩/安全档
+MIT_HOLD = 1         # 保持/重力补偿中间态
+MIT_TRACKING = 2     # 五字段阻抗跟踪
+
 #: GetBridgeStatus.safety_level
 SAFETY_OK, SAFETY_WARNING, SAFETY_FAULT, SAFETY_CRITICAL = 0, 1, 2, 3
 

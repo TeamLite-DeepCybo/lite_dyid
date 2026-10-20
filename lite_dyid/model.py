@@ -215,6 +215,37 @@ class RobotModel:
         """由参数算重力力矩（只取臂关节行）。"""
         return (self.gravity_regressor(q) @ params)[self.arm_v]
 
+    def fast_gravity_evaluator(self, params: np.ndarray):
+        """返回与 :meth:`gravity_torque` 等价、适合实时预计算的函数。
+
+        回归实现每次需要对每个参数基分别调用 Pinocchio。验证轨迹有数万拍，
+        因此把辨识得到的 ``[m,mx,my,mz]`` 一次写入模型，再用一次
+        ``computeGeneralizedGravity`` 求整机重力。转动惯量不参与重力项，置零不会
+        改变结果。
+        """
+        p = np.asarray(params, dtype=float).reshape(-1)
+        if p.shape != (self.n_params,) or not np.all(np.isfinite(p)):
+            raise DyidError(f"重力参数形状/数值无效：{p.shape}，期望 ({self.n_params},)")
+        gravity_model = self.model.copy()
+        for k, jid in enumerate(self.link_joints):
+            # gravity_regressor 的三个一阶矩基是 Inertia(1, e_axis, 0)，
+            # 因而每列除了单位一阶矩也各自带一个单位质量。把这些列线性合并成
+            # 单个模型时，等效质量必须是 p0+p1+p2+p3，一阶矩仍是 p1:p4。
+            # 这不是常见的直接 [m,mx,my,mz] 打包；按常见方式写会与已保存参数
+            # 的 predict_torque 相差约 0.2 N·m。
+            chunk = p[4 * k:4 * k + 4]
+            dynamic = np.zeros(10, dtype=float)
+            dynamic[0] = float(np.sum(chunk))
+            dynamic[1:4] = chunk[1:4]
+            gravity_model.inertias[jid] = pin.Inertia.FromDynamicParameters(dynamic)
+        gravity_data = gravity_model.createData()
+
+        def evaluate(q: np.ndarray) -> np.ndarray:
+            tau = pin.computeGeneralizedGravity(gravity_model, gravity_data, q)
+            return np.asarray(tau, dtype=float)[self.arm_v].copy()
+
+        return evaluate
+
     def arm_regressor(self, q: np.ndarray) -> np.ndarray:
         return self.gravity_regressor(q)[self.arm_v, :]
 

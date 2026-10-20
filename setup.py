@@ -34,6 +34,8 @@ setup(
             "dyid_validate = lite_dyid.validate:main",
             # 轨迹设计/校核工具（限位 + 速度 + mesh 碰撞，不碰机器人）
             "dyid_design = lite_dyid.design:main",
+            # MIT Kp=15/Kd=3 两频轨迹：无前馈 vs 最新辨识前馈的跟踪误差对比
+            "dyid_tracking_validate = lite_dyid.tracking_validate:main",
         ],
     },
 )
