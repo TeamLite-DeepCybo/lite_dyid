@@ -435,6 +435,7 @@ src/lite_dyid/
 ├── config/              dyid.yaml（默认参数）、trajectories.yaml（唯一交付轨迹）
 ├── launch/dyid.launch.py
 ├── docs/RUNBOOK.md      手动调试手册（上机前检查、故障排查、结果判读）
+├── docs/COMMAND_DISPATCH_CORE.md  **CSP/MIT 命令下发核心文档**（方法论 + 实现 + 下游契约）
 └── test/                离线单测（**不需要真机**）
 ```
 
