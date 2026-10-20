@@ -11,7 +11,7 @@
 ① 确认 CAN 干净（没有别的 bringup 在抢同一条总线）
 ② 用户终端启动 CSP 组 bringup：controller:=csp control_mode:=csp source_names:=dyid
 ③ 确认 mode5(CSP_MONITOR)、safety=OK、14 关节都有数
-④ 跑 dyid_collect：它自动做 预检 → 切 TRACKING → 小幅验证 → 采集 → 解算 → 问你是否验证
+④ 跑 dyid_collect：它自动做 CSP 状态确认 → 小幅验证 → 双臂 300 s 采集 → 解算
 ⑤ 收尾停在 CSP_HOLD；要松开用 §7 的命令
 ```
 
@@ -97,7 +97,7 @@ ros2 topic echo /joint_states --once       # 14 个关节，数值有限
 
 ---
 
-## 2. 一健跑（推荐）
+## 2. 一键运行
 
 ```bash
 source /opt/ros/jazzy/setup.bash && source install/setup.bash
@@ -111,36 +111,24 @@ ros2 run lite_dyid dyid_collect --output-dir /tmp/dyid_runs
 |---|---|---|
 | 预检 | 等 `/joint_states`、抓 URDF、查 `/safety_status`、`ensure_csp_ready()` | 起始姿态打印是否合理；`已进 CSP_HOLD/TRACKING` |
 | 小幅验证 | 逐关节 ±8.6°、0.1 rad/s，出去→停 1.5s→回来 | 14 行是否都 ✓；有 ❌ 会**立即中止** |
-| 采集 | 左臂轨迹 → 回位 → 右臂轨迹 → 回位（每条 200s 运动 + 20×10s 静止） | 每秒一行 `静止 k/20`；`σ_pos_max` 应在 0.0x° 量级 |
+| 采集 | 左右臂同步运行一条 300 s 轨迹；14 关节各覆盖至少 80%；15×6 s 静止 | `静止 k/15`；`σ_pos_max` 应在 0.0x° 量级 |
 | 解算 | 重力 → 冻结 → 摩擦；打印残差表 | 重力拟合 RMS、`k`（应≈1） |
-| 询问 | `是否用第三条轨迹进行验证？[y/N]` | 答 y 会跑 120s 的第三条轨迹并出图 |
 
-**顺序建议**：第一次一定先只跑一条短轨迹试水（§3.1），确认无事再跑完整流程。
+第一次先按 §3.1 只跑小幅通路检查；大幅默认轨迹留给正式采集。
 
 ---
 
 ## 3. 逐步手动（调试用）
 
-### 3.1 短轨迹试水（强烈建议第一次这么做）
+### 3.1 只跑小幅真机检查
 
 ```bash
-# 造一份 40s / 3 段静止的临时轨迹表
-/usr/bin/python3 - <<'EOF'
-import yaml, pathlib
-d = yaml.safe_load(open("src/dyid/config/trajectories.yaml"))
-for t in d["trajectories"]:
-    if t["role"] == "train":
-        t.update({"duration_sec": 40.0, "ramp_sec": 12.0, "static_insert_count": 3,
-                  "static_hold_sec": 4.0, "static_settle_sec": 2.0})
-    else:
-        t.update({"duration_sec": 30.0, "ramp_sec": 10.0})
-pathlib.Path("/tmp/dyid_rehearsal.yaml").write_text(
-    yaml.safe_dump(d, allow_unicode=True, sort_keys=False))
-EOF
-
-ros2 run lite_dyid dyid_collect --trajectories /tmp/dyid_rehearsal.yaml \
-    --output-dir /tmp/dyid_runs --no-validate-prompt
+ros2 run lite_dyid dyid_collect --small-check-only --output-dir /tmp/dyid_runs
 ```
+
+该命令仍会先确认协议是 CSP，并按 HOLD→TRACKING 进入；随后只做 14 个关节各
+8.6°、0.1 rad/s 的小幅往返。结束时停止下发、解除数据源锁并停在 CSP_HOLD，
+不会进入 80% 大幅轨迹。
 
 ### 3.2 轨迹只校核、不动电机
 
@@ -182,7 +170,7 @@ run_YYYYmmdd_HHMMSS/
 ├── small_check.csv            小幅验证逐关节结果
 ├── statics.csv                静力学（**平均后**）：每个静止段一行
 ├── statics_raw_<traj>.csv     静止段原始样本（排查用）
-├── dynamics.csv               两条训练轨迹的运动段原始样本（合并）
+├── dynamics.csv               双臂同步训练轨迹的运动段原始样本
 ├── dynamics_<traj>.csv        分轨迹版本
 ├── params.json                辨识结果（重力参数 + 摩擦 + 拟合指标）
 ├── train_gravity_fit.png      静止样本：实测 vs 计算
@@ -246,8 +234,8 @@ run_YYYYmmdd_HHMMSS/
 
 逐关节 3 参数最小二乘。`c2` 共用（不随符号变），`c1` 分速度符号。
 
-本阶段**不引入惯性项**：轨迹峰值速度 0.13 rad/s、峰值加速度 0.075 rad/s²，
-准静态假设成立。若验证残差里出现明显与 `v̇` 同相的分量，说明该假设在本轨迹上不够 —— **图上能直接看出来**。
+默认模型不引入惯性项；需要惯量张量时用 `--with-inertia`。若残差里出现明显与
+`v̇` 同相的分量，应对比带惯性模型。
 
 ---
 
@@ -280,17 +268,17 @@ run_YYYYmmdd_HHMMSS/
 
 
 
-改 `src/dyid/config/trajectories.yaml`（或先 `dyid_design --generate` 再改）：
+改 `src/lite_dyid/config/trajectories.yaml`（或先 `dyid_design --generate` 再改）：
 
 | 想改什么 | 改哪里 | 注意 |
 |---|---|---|
 | 振幅更大/更小 | `amplitudes`（rad/关节） | 变大必须重跑 `dyid_design --check` 看限位与碰撞 |
-| 更快/更慢 | `frequency_hz` | 峰值速度 ≈ `amp × 1.98 × 2πf`；本机 0.035 Hz → 0.13 rad/s |
-| 静止段数/时长 | `static_insert_count` / `static_hold_sec` / `static_period_sec` | 段数越多采集越久；20×10 s 已是 +200 s/条 |
-| 两条轨迹镜像 | `dyid_design --generate` 里的 `MIRROR_SIGN` | pitch 保号，roll/yaw 取反 |
+| 更快/更慢 | `frequency_hz` | 当前基频 0.011 Hz；修改后必须重跑速度与碰撞校核 |
+| 静止段数/时长 | `static_insert_count` / `static_hold_sec` / `static_period_sec` | 当前 15×6 s，额外增加 90 s 墙钟时间 |
+| 双臂镜像 | `dyid_design.PHASES_LEFT` 与 `MIRROR_SIGN` | 两臂同时间运动；pitch 保号，roll/yaw 取反 |
 | 前馈 | — | 本包不发前馈力矩（CSP 没有力矩入口） |
 
-改 `src/dyid/config/dyid.yaml`：
+改 `src/lite_dyid/config/dyid.yaml`：
 
 | 参数 | 说明 |
 |---|---|
@@ -332,7 +320,7 @@ ros2 service call /lite_bridge/clear_fault std_srvs/srv/Trigger "{}"
 | 现象 | 原因 / 处理 |
 |---|---|
 | `服务不可用：/lite_bridge/set_mode` | bringup 是**旧构建**（还有 mode_manager、没有 set_mode）。重新 `colcon build` 后按 §1.3 重启 |
-| `当前 bringup 不是 CSP 组，运行期不能跨协议切换` | 用日志里给出的 `required_launch_args` 重启（`controller:=csp control_mode:=csp`） |
+| `启动检查检测到 protocol=mit` | 停止当前 bringup，用 `controller:=csp control_mode:=csp source_names:=dyid` 重启；程序尚未下发位置命令 |
 | `服务不可用：...` / spawner 报 `PermissionError: .../locks/ros2-control-controller-spawner.lock` | `~/.ros` 不可写（容器/沙箱）。`export ROS_HOME=/tmp/ros_home` 后再 launch |
 | `命令只覆盖 x/14 个关节`（桥日志） | 本包永远发全 14；出现即说明有人在用 `ros2 topic pub` 发单关节命令 |
 | 小幅验证某关节 ❌ | 该关节顶不动/被限位钳住/不在伺服态。`ros2 run lite_bridge motor_monitor --once` 看 目标/实际/力矩占额 |

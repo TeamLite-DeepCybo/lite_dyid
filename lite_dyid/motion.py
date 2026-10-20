@@ -11,7 +11,7 @@
 
 实时性
 ======
-上位机 100 Hz 下发、控制器 100 Hz 写 loc_ref。命令**陈旧也不松劲**
+上位机默认 200 Hz 下发。命令**陈旧也不松劲**
 （CspTrackingController 保持锁存目标），所以偶发的调度抖动不会让机械臂塌下来
 —— 这是选 CSP 而不是 MIT 的重要原因之一。
 """
@@ -74,7 +74,7 @@ def move_joints(
     client,
     target: Sequence[float],
     *,
-    rate_hz: float = 100.0,
+    rate_hz: float = 200.0,
     speed_cap: float = 0.10,
     start: Optional[Sequence[float]] = None,
     cancel: Optional[Callable[[], bool]] = None,
@@ -123,7 +123,7 @@ def hold_position(
     position: Sequence[float],
     *,
     duration_sec: float,
-    rate_hz: float = 100.0,
+    rate_hz: float = 200.0,
     cancel: Optional[Callable[[], bool]] = None,
     on_sample: Optional[Callable[[np.ndarray, np.ndarray, float], None]] = None,
 ) -> None:

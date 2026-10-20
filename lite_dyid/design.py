@@ -1,24 +1,17 @@
 # Copyright (c) 2026
 # Licensed under the Apache License, Version 2.0
 
-"""轨迹设计与校核工具（**不碰机器人**）。
+"""交付轨迹的生成与离线校核。
 
-    dyid_design --check   --pose-file <run_meta.json>   # 校核 trajectories.yaml
-    dyid_design --generate config/trajectories.yaml      # 重新生成轨迹定义
+默认配置只保留一条双臂同步训练轨迹：
 
-设计约束（用户要求 + 本机实测）
-================================
-* 肩部单关节变动 ≤ 50°
-* 峰值速度 ≈ 0.15 rad/s、加速度尽可能小（"速度变化较慢"）
-* 不越 URDF 限位（稳态留 ≥ 0.10 rad 余量）
-* 在当前 mesh 下**无碰撞**（pinocchio + hppfcl，排除相邻/同关节/夹爪对）
-* 前两条左右镜像（符号 mirror：pitch 保号，roll/yaw 取反），第三条做验证
+* 左右臂同时运动，运动时间 300 s；
+* 每个关节覆盖 URDF 有效区间的 80%；
+* 1～4 次谐波幅度依次减小，低频负责大范围构型覆盖，高频只补充动态信息；
+* 肩/肘峰值速度不超过 0.2 rad/s，腕部不超过 0.4 rad/s；
+* 运行前用现场 URDF 再做限位、速度、覆盖率与 mesh 碰撞检查。
 
-为什么用"相对起始姿态的 bias"而不是绝对 center
-----------------------------------------------
-本机左肩 roll 停在 −89.3°、上限 −90°，只有 0.7° 余量。写死 center 要么越限、
-要么浪费行程。bias 让运行期按实测姿态把工作点推进限位内，且 |amp|=0 的关节
-**严格不动**。
+``dyid_design`` 只做离线计算，不发布机器人命令。
 """
 
 from __future__ import annotations
@@ -33,84 +26,118 @@ from typing import Optional, Sequence
 import numpy as np
 import yaml
 
-from .common import ARM_JOINTS, DyidError, config_path
+from .common import (ARM_JOINTS, MIRROR_SIGN, DyidError, config_path,
+                     velocity_caps)
+from .limits_table import limits_array, midpoint
 from .trajectory import FourierTrajectory, load_specs
 
-#: 参考起始姿态（本机 2026-10-13 实测）——仅当没有 --pose / --pose-file 时用于校核
-REFERENCE_POSE = np.array([
-    0.0564, -1.5582, 0.4550, -0.1300, 0.2127, 0.0625, -0.0307,
-    0.0961, 1.5559, -0.1918, 0.1992, 0.7816, 0.0640, -0.1787,
-], dtype=float)
 
-#: 左右手镜像是"pitch 保号、roll/yaw 取反"
-MIRROR_SIGN = np.array([1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0])
+TRAJECTORY_NAME = "dyid_train_bimanual"
+DURATION_SEC = 300.0
+RAMP_SEC = 60.0
+BASE_FREQUENCY_HZ = 0.011
+MIN_COVERAGE = 0.80
+MIN_PEAK_SPEED = 0.05
+APPROACH_SPEED_CAP = 0.10
 
-#: 左臂的偏置与振幅（rad）。偏置把工作点推离限位；振幅决定激励强度。
-BIAS7 = np.array([0.00, 0.34, 0.00, -0.28, 0.00, 0.00, 0.00])
-AMP7 = np.array([0.32, 0.33, 0.32, 0.28, 0.28, 0.24, 0.24])
-
-HARMONIC_WEIGHTS = [1.0, 0.62, 0.42, 0.27]
+# 低频大幅、高频小幅。归一化后整条曲线仍精确覆盖 80%，这些权重只决定
+# 频谱能量如何分配：一阶占绝对主导，四阶只保留少量动态激励。
+HARMONIC_WEIGHTS = [1.0, 0.35, 0.15, 0.05]
 HARMONIC_INDICES = [1, 2, 3, 4]
 
-SPECS = [
-    # name, role, freq, duration, ramp, 振幅缩放
-    ("dyid_train_left",  "train",    0.035, 200.0, 25.0, 1.00),
-    ("dyid_train_right", "train",    0.035, 200.0, 25.0, 1.00),
-    ("dyid_validate",    "validate", 0.040, 120.0, 25.0, 0.75),
-]
+# 固定相位来自 80% 覆盖率下的离线相位搜索。搜索目标不是缩幅，而是在保持每个
+# 关节完整 80% 行程的前提下错开多关节极值。展开后的 arms URDF 上，一个周期
+# 6001 点 mesh 检查无碰撞；运行期仍会结合真实起始姿态重新检查整条 300 s 轨迹。
+PHASES_LEFT = np.array([
+    [0.766925413, 4.574369257, 2.745677666, 4.078077080],
+    [3.993557108, 5.318963076, 3.917644155, 4.053431310],
+    [6.251277049, 3.691402811, 1.910702988, 5.031623590],
+    [5.446989931, 2.586383867, 2.486554870, 4.041143292],
+    [3.503903245, 3.254639750, 2.047977393, 3.234328940],
+    [0.860482940, 1.537667005, 1.947057961, 5.959546881],
+    [0.918325294, 3.852925657, 5.938531865, 1.355114821],
+], dtype=float)
+
+
+def _delivery_trajectory() -> dict:
+    lo, hi = limits_array()
+    half_travel = 0.5 * MIN_COVERAGE * (hi - lo)
+    # 右臂使用同一相位，并用镜像符号反转 roll/yaw。两个手臂因此在同一 300 s
+    # 窗口里同步采样，原来左右分开的两条训练轨迹不再串行执行。
+    amplitudes = np.concatenate([
+        half_travel[:7],
+        half_travel[7:] * np.asarray(MIRROR_SIGN, dtype=float),
+    ])
+    phases = np.vstack([PHASES_LEFT, PHASES_LEFT])
+    return {
+        "name": TRAJECTORY_NAME,
+        "role": "train",
+        "duration_sec": DURATION_SEC,
+        "ramp_sec": RAMP_SEC,
+        "frequency_hz": BASE_FREQUENCY_HZ,
+        "center_mode": "midpoint",
+        "approach_speed_cap": APPROACH_SPEED_CAP,
+        "bias": [0.0] * len(ARM_JOINTS),
+        "amplitudes": [round(float(x), 9) for x in amplitudes],
+        "phases": [[round(float(x), 9) for x in row] for row in phases],
+        "harmonic_weights": HARMONIC_WEIGHTS,
+        "harmonic_indices": HARMONIC_INDICES,
+        "normalization": "l1",
+        "peak_normalize": True,
+        "min_coverage": MIN_COVERAGE,
+        "min_peak_speed": MIN_PEAK_SPEED,
+        # 静止段插在运动时间轴上；运动时间仍是完整 300 s。15×6 s 的保持用于
+        # 重力回归，段内最后 3 s 取稳态平均。
+        "static_insert_count": 15,
+        "static_period_sec": 20.0,
+        "static_hold_sec": 6.0,
+        "static_settle_sec": 3.0,
+    }
 
 
 def build_specs() -> dict:
-    """生成 3 条轨迹的 YAML 结构（phases 固定种子，保证可复现）。"""
-    rng = np.random.default_rng(20261013)
-    ph_left = rng.uniform(0.0, 2.0 * math.pi, (14, 4))
-    ph_left[7:, :] = 0.0                      # 右臂不激励 → 相位无意义
-
-    ph_right = np.zeros((14, 4))
-    ph_right[7:, :] = ph_left[:7, :]          # 镜像：同一组相位
-
-    rng3 = np.random.default_rng(777)
-    ph_val = rng3.uniform(0.0, 2.0 * math.pi, (14, 4))
-
-    amp_left = np.concatenate([AMP7, np.zeros(7)])
-    bias_left = np.concatenate([BIAS7, np.zeros(7)])
-    amp_right = np.concatenate([np.zeros(7), AMP7 * MIRROR_SIGN])
-    bias_right = np.concatenate([np.zeros(7), BIAS7 * MIRROR_SIGN])
-    amp_val = np.concatenate([AMP7 * 0.75, AMP7 * 0.75 * MIRROR_SIGN])
-    bias_val = np.concatenate([BIAS7, BIAS7 * MIRROR_SIGN])
-
-    phases = {"dyid_train_left": ph_left, "dyid_train_right": ph_right,
-              "dyid_validate": ph_val}
-    amps = {"dyid_train_left": amp_left, "dyid_train_right": amp_right,
-            "dyid_validate": amp_val}
-    biases = {"dyid_train_left": bias_left, "dyid_train_right": bias_right,
-              "dyid_validate": bias_val}
-
-    trajs = []
-    for name, role, freq, dur, ramp, _scale in SPECS:
-        entry = {
-            "name": name, "role": role,
-            "duration_sec": dur, "ramp_sec": ramp, "frequency_hz": freq,
-            "bias": [round(float(x), 6) for x in biases[name]],
-            "amplitudes": [round(float(x), 6) for x in amps[name]],
-            "phases": [[round(float(x), 6) for x in row] for row in phases[name]],
+    """返回唯一的交付轨迹配置，结果固定且可复现。"""
+    return {
+        "defaults": {
+            "normalization": "l1",
             "harmonic_weights": HARMONIC_WEIGHTS,
             "harmonic_indices": HARMONIC_INDICES,
-            "normalization": "l1",
-        }
-        if role == "train":
-            entry.update({"static_insert_count": 20, "static_period_sec": 10.0,
-                          "static_hold_sec": 10.0, "static_settle_sec": 4.0})
-        else:
-            # 验证轨迹不需要静止段（它只用运动段算残差）—— 省 ~2 min 机器人时间
-            entry.update({"static_insert_count": 0})
-        trajs.append(entry)
-
-    return {
-        "defaults": {"normalization": "l1", "harmonic_weights": HARMONIC_WEIGHTS,
-                     "harmonic_indices": HARMONIC_INDICES},
-        "trajectories": trajs,
+            "center_mode": "midpoint",
+            "approach_speed_cap": APPROACH_SPEED_CAP,
+            "peak_normalize": True,
+            "min_coverage": MIN_COVERAGE,
+            "min_peak_speed": MIN_PEAK_SPEED,
+        },
+        "trajectories": [_delivery_trajectory()],
     }
+
+
+def build_large_specs(collide=None) -> dict:
+    """兼容旧调用名；大幅双臂轨迹现在就是唯一交付档。"""
+    payload = build_specs()
+    if collide is not None:
+        spec = _spec_from_payload(payload)
+        lo, hi = limits_array()
+        traj = FourierTrajectory(spec, midpoint(), (lo, hi),
+                                 v_cap=np.asarray(velocity_caps(), dtype=float))
+        for t in np.linspace(0.0, traj.duration, 2401):
+            q, _ = traj.evaluate(float(t))
+            if collide(q):
+                raise DyidError(
+                    f"{TRAJECTORY_NAME} 在 t={t:.3f}s 碰撞；80% 幅度不会自动缩小，"
+                    "请重新设计相位")
+    return payload
+
+
+def _spec_from_payload(payload: dict):
+    """通过与运行期相同的 YAML 加载器构造 TrajectorySpec。"""
+    import tempfile
+    # 该帮助函数只供兼容的 build_large_specs(collision_cb) 使用。使用命名临时
+    # 文件可以复用 load_specs 的全部字段校验，关闭后立即删除。
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", encoding="utf-8") as f:
+        yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
+        f.flush()
+        return load_specs(Path(f.name))[TRAJECTORY_NAME]
 
 
 def _pose_from(args) -> np.ndarray:
@@ -118,81 +145,89 @@ def _pose_from(args) -> np.ndarray:
         vals = [float(x) for x in args.pose.replace(",", " ").split()]
         if len(vals) != len(ARM_JOINTS):
             raise DyidError(f"--pose 需要 {len(ARM_JOINTS)} 个数，得到 {len(vals)}")
-        return np.array(vals)
+        return np.asarray(vals, dtype=float)
     if args.pose_file:
         payload = json.loads(Path(args.pose_file).expanduser().read_text(encoding="utf-8"))
-        if "start_pose_rad" in payload:
-            return np.asarray(payload["start_pose_rad"], dtype=float)
-        if "q" in payload:
-            return np.asarray(payload["q"], dtype=float)
+        for key in ("start_pose_rad", "q"):
+            if key in payload:
+                q = np.asarray(payload[key], dtype=float)
+                if q.shape != (len(ARM_JOINTS),):
+                    raise DyidError(f"{args.pose_file} 的 {key} 形状不是 14")
+                return q
         raise DyidError(f"{args.pose_file} 里没有 start_pose_rad / q")
-    print("[design] 未给 --pose/--pose-file，使用内置参考姿态校核")
-    return REFERENCE_POSE.copy()
+    return midpoint()
+
+
+def _urdf_from_args(args) -> str:
+    if args.urdf:
+        return Path(args.urdf).expanduser().read_text(encoding="utf-8")
+    if args.pose_file:
+        pose_path = Path(args.pose_file).expanduser()
+        candidate = pose_path.parent / "robot.urdf"
+        if pose_path.name == "run_meta.json" and candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    raise DyidError("校核需要 --urdf，或让 --pose-file 指向采集目录里的 run_meta.json")
 
 
 def cmd_check(args) -> int:
     from .model import RobotModel
-    urdf = Path(args.urdf).read_text(encoding="utf-8") if args.urdf else None
-    if urdf is None:
-        run_meta = None
-        if args.pose_file:
-            p = Path(args.pose_file).expanduser()
-            if p.name == "run_meta.json" and (p.parent / "robot.urdf").is_file():
-                run_meta = p.parent / "robot.urdf"
-        if run_meta is not None:
-            urdf = run_meta.read_text(encoding="utf-8")
-        else:
-            raise DyidError("校核需要 URDF：请给 --urdf，或让 --pose-file 指向采集目录里的 run_meta.json")
-    model = RobotModel(urdf)
-    specs = load_specs(Path(args.trajectories).expanduser() if args.trajectories
-                       else config_path("trajectories.yaml"))
+
+    model = RobotModel(_urdf_from_args(args))
+    path = Path(args.trajectories).expanduser() if args.trajectories else config_path("trajectories.yaml")
+    specs = load_specs(path)
     pose = _pose_from(args)
+    caps = np.asarray(velocity_caps(), dtype=float)
     all_ok = True
+
     for spec in specs.values():
         traj = FourierTrajectory(spec, pose, model.limit_array(),
-                                 speed_cap=float(args.speed_cap))
-        chk = traj.check(samples=int(args.samples))
-        print(f"\n===== {spec.name}（{spec.role}）f={spec.frequency_hz}Hz "
-              f"dur={spec.duration_sec:.0f}s ramp={traj.ramp:.1f}s =====")
-        print(f"{'joint':22s} {'steady(deg)':>18s} {'Δ°':>7s} {'vmax':>7s} "
-              f"{'amax':>7s} {'余量°':>7s} {'稳态余量°':>9s}")
-        for k, jn in enumerate(ARM_JOINTS):
+                                 speed_cap=float(args.speed_cap), v_cap=caps)
+        check = traj.check(samples=int(args.samples))
+        print(f"\n===== {spec.name} ({spec.role}) =====")
+        print(f"运动 {traj.duration:.0f}s，基频 {spec.frequency_hz:.4f}Hz，"
+              f"1~4 次谐波 {list(spec.harmonic_weights)}，进入段 {traj.ramp:.1f}s")
+        print(f"{'joint':22s} {'coverage':>9s} {'v_peak':>9s} {'v_cap':>8s} "
+              f"{'q_min(deg)':>11s} {'q_max(deg)':>11s}")
+        for k, joint in enumerate(ARM_JOINTS):
             if abs(spec.amplitudes[k]) < 1e-12:
                 continue
-            print(f"{jn:22s} [{math.degrees(chk.q_min[k]):+7.1f},"
-                  f"{math.degrees(chk.q_max[k]):+7.1f}] "
-                  f"{chk.travel_deg[k]:7.1f} {chk.v_peak[k]:7.3f} {chk.a_peak[k]:7.3f} "
-                  f"{chk.limit_margin_deg[k]:7.1f} {chk.limit_margin_steady_deg[k]:9.1f}")
-        hits = 0
+            print(f"{joint:22s} {check.coverage[k] * 100:8.2f}% "
+                  f"{check.v_peak[k]:9.4f} {caps[k]:8.3f} "
+                  f"{math.degrees(check.q_min[k]):11.2f} "
+                  f"{math.degrees(check.q_max[k]):11.2f}")
+
+        hits = []
         for t in np.linspace(0.0, traj.duration, int(args.collision_samples)):
             q, _ = traj.evaluate(float(t))
-            if model.collisions(dict(zip(ARM_JOINTS, q))):
-                hits += 1
-        print(f"  峰值速度 {chk.v_peak.max():.3f} rad/s  峰值加速度 {chk.a_peak.max():.3f} rad/s²  "
-              f"碰撞采样点 {hits}")
-        if chk.problems or hits:
+            collisions = model.collisions(dict(zip(ARM_JOINTS, q)))
+            if collisions:
+                hits.append((float(t), collisions[0]))
+                break
+        if traj.clamp_count:
+            check.problems.append(f"运行期限位钳位 {traj.clamp_count} 次")
+        if hits:
+            t, hit = hits[0]
+            check.problems.append(
+                f"t={t:.3f}s mesh 碰撞 {hit.first} ↔ {hit.second} depth={hit.depth:.6f}m")
+        if check.problems:
             all_ok = False
-            print(f"  ❌ {chk.problems}{' + 碰撞' if hits else ''}")
+            print("  FAIL: " + "；".join(check.problems))
         else:
-            print("  ✓ 通过（限位 / 速度 / 肩部幅度 / mesh 碰撞）")
-    print("\n结论：" + ("全部通过 ✓" if all_ok else "存在问题 ❌"))
+            print("  PASS: 80% 覆盖、速度上下限、关节限位和 mesh 碰撞检查全部通过")
+
     return 0 if all_ok else 1
 
 
 def cmd_generate(args) -> int:
-    payload = build_specs()
     out = Path(args.generate).expanduser()
-    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = build_specs()
     header = (
-        "# lite_dyid 傅里叶激励轨迹（由 dyid_design --generate 生成）\n"
-        "#\n"
-        "# bias      = 相对**起始姿态**的偏置（rad）；运行期按限位裁剪，\n"
-        "#             |amp|=0 的关节严格保持起始姿态。\n"
-        "# amplitudes= 傅里叶幅值（rad）\n"
-        "# phases    = (14, 4) 相位（rad），固定种子以便复现\n"
-        "# 峰值速度 ≈ 0.13 rad/s、峰值加速度 ≈ 0.075 rad/s²、肩部单关节 ≤35.5°\n"
-        "# 设计/校核：dyid_design --check --pose-file <run_meta.json>\n"
+        "# lite_dyid 交付轨迹：双臂同步、300 s、逐关节至少 80% 行程\n"
+        "# 低频大幅、高频小幅；默认配置即正式大幅采集版本。\n"
+        "# 生成：dyid_design --generate <path>\n"
+        "# 校核：dyid_design --check --urdf <expanded.urdf>\n"
     )
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(header + yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
                    encoding="utf-8")
     print(f"已写入 {out}")
@@ -200,17 +235,26 @@ def cmd_generate(args) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    p = argparse.ArgumentParser(prog="dyid_design", description="轨迹设计/校核（不碰机器人）")
-    p.add_argument("--check", action="store_true", help="校核 trajectories.yaml")
-    p.add_argument("--generate", default=None, help="重新生成 trajectories.yaml 的路径")
-    p.add_argument("--trajectories", default=None)
-    p.add_argument("--urdf", default=None)
-    p.add_argument("--pose", default=None, help="14 个关节角(rad)，逗号或空格分隔")
-    p.add_argument("--pose-file", default=None, help="run_meta.json 或含 q 的 json")
-    p.add_argument("--speed-cap", type=float, default=0.15)
-    p.add_argument("--samples", type=int, default=4000)
-    p.add_argument("--collision-samples", type=int, default=120)
-    args, _unknown = p.parse_known_args(argv)
+    parser = argparse.ArgumentParser(prog="dyid_design", description="交付轨迹生成/校核（不碰机器人）")
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--generate", default=None)
+    parser.add_argument("--profile", default="delivery",
+                        choices=["delivery", "standard", "large"],
+                        help="兼容参数；三个名称都指向同一交付轨迹")
+    parser.add_argument("--trajectories", default=None)
+    parser.add_argument("--urdf", default=None)
+    parser.add_argument("--pose", default=None)
+    parser.add_argument("--pose-file", default=None)
+    parser.add_argument("--speed-cap", type=float, default=0.15)
+    parser.add_argument("--samples", type=int, default=12000)
+    parser.add_argument("--collision-samples", type=int, default=6001)
+    # 保留旧命令行的参数名，避免脚本升级后直接解析失败；覆盖率由 YAML 中的
+    # min_coverage=0.80 固定，不允许从命令行悄悄降低。
+    parser.add_argument("--min-coverage", type=float, default=None,
+                        help="已弃用；交付轨迹固定为 0.80")
+    args, _unknown = parser.parse_known_args(argv)
+    if args.min_coverage is not None and abs(args.min_coverage - MIN_COVERAGE) > 1e-9:
+        raise DyidError("交付轨迹覆盖率固定为 0.80，不能用 --min-coverage 降低")
     if args.generate:
         return cmd_generate(args)
     return cmd_check(args)

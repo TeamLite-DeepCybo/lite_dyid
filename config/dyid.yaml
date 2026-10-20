@@ -11,15 +11,20 @@ lite_dyid:
   ros__parameters:
     # --- 通路 ---
     source: dyid                 # 必须出现在 bringup 的 source_names 里
-    publish_rate_hz: 100.0       # 下发频率；控制器 100 Hz 写 loc_ref
+    # 下发频率 = 采样点密度（一个循环里既下发又记录，所以两者同频）。
+    # ⚠️ **硬上限 200 Hz**（collect.py 会钳位）；默认从 100 提到 200：
+    #    点数翻倍 → 速度估计更准、惯量回归的样本更密。
+    #    ⚠️ 频率**不改变轨迹的时间-状态关系**：q(t) 是同一函数，只是采得更细。
+    #    ⚠️ 再往上（500 Hz）会让 1 Mbit/s CAN 出现 TX_QUEUE_OVERRUN，不要加。
+    publish_rate_hz: 200.0
     command_timeout_ms: 300.0    # MotionCommand.timeout_ms（桥看门狗）
 
     # --- 轨迹与限速 ---
-    speed_cap: 0.15              # 目标峰值速度 rad/s（设计值 ≈0.13）
+    speed_cap: 0.15              # 进入段限速基准；稳态逐关节上限在 common.py
     return_speed: 0.12           # 回起始姿态的速度上限 rad/s
 
     # --- 小幅运动验证（每关节，不碰限位）---
-    small_delta_rad: 0.15        # 8.6°，远小于用户要求的 15°
+    small_delta_rad: 0.15        # 8.6°，仅用于正式采集前的通路检查
     small_speed: 0.10            # rad/s
     small_hold_sec: 1.5          # 到位后停留，等稳态
     small_reach_ratio: 0.5       # 实动 ≥ 50% 命令幅度才算"命令真的到位"
@@ -27,7 +32,7 @@ lite_dyid:
 
     # --- 辨识 ---
     # ⚠️ 求解前先对 cmd/q/v/tau 做**零相位**低通（同一个滤波器、同一带宽）。
-    #    本机轨迹成分最高 0.14 Hz（基频 0.035 Hz × 4 次谐波），0.2 Hz 是
+    #    交付轨迹成分最高 0.044 Hz（基频 0.011 Hz × 4 次谐波），0.2 Hz 是
     #    "能保住运动本身"的最低带宽；再低就开始削信号而不是噪声。
     #    设 0 = 不滤波（残差里会混进测量噪声与高频未建模效应）。
     lpf_hz: 0.2
@@ -43,4 +48,4 @@ lite_dyid:
     ridge: 0.000001              # 岭系数（只作用于不可辨识方向）
 
     # --- 校核 ---
-    collision_samples: 400       # 轨迹 mesh 碰撞检查的采样点数
+    collision_samples: 6001      # 运行前整条轨迹 mesh 碰撞检查采样点数（约 20 Hz）

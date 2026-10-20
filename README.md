@@ -1,10 +1,10 @@
 # lite_dyid
 
-Lite 双臂 **CSP 动力学辨识**：傅里叶激励 + 插入静止段 → 重力（质量/质心）辨识 →
-摩擦辨识 → 第三条轨迹验证与残差可视化。
+Lite 双臂 **CSP 动力学辨识**：启动状态确认 → 小幅通路检查 → 双臂同步大幅
+傅里叶激励 → 重力（质量/质心）与摩擦辨识。
 
 ```bash
-ros2 run lite_dyid dyid_collect       # 预检 → 切 CSP → 小幅验证 → 采集 → 解算 → 问你是否验证
+ros2 run lite_dyid dyid_collect       # 确认 CSP → 小幅验证 → 双臂 300 s 采集 → 解算
 ros2 launch lite_dyid dyid.launch.py  # 同上（launch 包装）
 ```
 
@@ -18,12 +18,12 @@ ros2 launch lite_dyid dyid.launch.py  # 同上（launch 包装）
 
 ### 0.1 必须这样排布
 
-本包必须位于 `lite_core_controller` **工作空间的 `src/` 下、目录名 `dyid`**：
+本包必须位于 `lite_core_controller` **工作空间的 `src/` 下、目录名 `lite_dyid`**：
 
 ```
 lite_core_controller/
 ├── src/
-│   ├── dyid/                    ← 本包（包名 lite_dyid，目录名 dyid）
+│   ├── lite_dyid/               ← 本包（包名 lite_dyid，目录名 lite_dyid）
 │   │   ├── package.xml
 │   │   ├── setup.py / setup.cfg
 │   │   ├── resource/lite_dyid
@@ -43,7 +43,7 @@ lite_core_controller/
 
 | 约束 | 原因 |
 |---|---|
-| 目录名 `dyid` | `setup.py` 的 `data_files` 用相对路径；colcon 按目录发现包，与 `package.xml` 的 `<name>lite_dyid</name>` 解耦 |
+| 目录名 `lite_dyid` | `setup.py` 的 `data_files` 用相对路径；colcon 按目录发现包，与 `package.xml` 的 `<name>lite_dyid</name>` 一致（曾用名 `dyid`，已更名）|
 | 必须在同一 `src/` 下 | 本包不 `import` 任何 `lite_*` 的 Python 模块，但**运行期**依赖它们的**话题/服务/URDF**；同一 colcon 工作空间才能保证 `source install/setup.bash` 后 `robstride_msgs` 与 `lite_description` 可用 |
 | 不能放进 `src/` 更深层 | colcon 只递归一层 `src/*/` |
 
@@ -97,22 +97,17 @@ ros2 launch lite_bringup lite_bringup.launch.py \
         │ 逐关节：出去 → 停 1.5s → 回来；命令没到位就**中止**    │
         └──────────────────┬──────────────────────────────────┘
                            ▼
-   ┌── 训练轨迹 ×2（左臂 / 右臂镜像）──────────────────────────┐
-   │ 200 s 傅里叶运动（峰值 0.13 rad/s）                        │
-   │  每 10 s 插入 10 s 静止 → 记录**平均**姿态与力矩 → 静力学 CSV │
-   │ 运动段原始 q/v/τ → 动力学 CSV                              │
-   │ 整条结束后**平滑回起始姿态**，再跑下一条                     │
+   ┌── 一条双臂同步训练轨迹 ────────────────────────────────────┐
+   │ 300 s 傅里叶运动；14 关节各覆盖至少 80% 有效区间             │
+   │ 低频大幅、高频小幅；每 20 s 插入 6 s 静止                    │
+   │ 运动段原始 q/v/τ → 动力学 CSV；静止段平均 → 静力学 CSV       │
    └──────────────────┬──────────────────────────────────────┘
                       ▼
    ┌── 自动解算（默认：静态 + 摩擦）──────────────────────────┐
    │ ① 静力学 → pinocchio 重力回归 → 每连杆 (m, m·c) → 冻结    │
    │ ② 动力学 → τ−τ_grav → 摩擦 c1⁺/c1⁻/c2                    │
    └──────────────────┬──────────────────────────────────────┘
-                      ▼
-   ┌── 询问：用第三条轨迹验证？──────────────────────────────┐
-   │ 跑 120 s 验证轨迹 → 残差 = τ_实测 − (τ_grav + τ_fric)     │
-   │ → validation/ 下出 5 张图 + residual_stats.csv          │
-   └───────────────────────────────────────────────────────┘
+   └───────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -137,7 +132,7 @@ source install/setup.bash
 | `--source` | `dyid` | 数据源名，必须在 `source_names` 里 |
 | `--trajectories` | 包内 `config/trajectories.yaml` | 轨迹定义 |
 | `--config` | 包内 `config/dyid.yaml` | 默认参数 |
-| `--rate-hz` | 100 | 下发频率 |
+| `--rate-hz` | **200** | 下发与记录循环频率；硬上限 200 Hz |
 | `--speed-cap` | 0.15 | 轨迹速度上限 rad/s |
 | `--lpf` | **0.2** | 求解前的零相位低通截止频率 Hz（0 = 不滤） |
 | `--workers` | **4** | 辨识并行进程数（1 = 串行） |
@@ -145,6 +140,7 @@ source install/setup.bash
 | `--ridge` | 1e-6 | 正则系数（只作用于不可辨识方向） |
 | `--small-delta` | 0.15 | 小幅验证单关节幅度 rad |
 | `--skip-small-check` | 关 | 跳过小幅验证（**不推荐**） |
+| `--small-check-only` | 关 | 只做 CSP 启动检查和小幅验证，不进入 80% 大幅轨迹 |
 | `--traj` | 训练轨迹 | 只跑指定轨迹（逗号分隔） |
 | `--auto-validate` | 关 | 不问，直接跑验证 |
 | `--no-validate-prompt` | 关 | 不问，也不验证 |
@@ -172,22 +168,31 @@ ros2 run lite_dyid dyid_identify --run-dir <采集目录> --legacy          # �
 
 | 约束 | 达成 |
 |---|---|
-| 肩部单关节变动 ≤ 50° | 实测 **≤ 35.5°** |
-| 速度 ≈ 0.15 rad/s | 峰值 **0.130 rad/s**（f=0.035 Hz） |
-| 速度变化慢 | 峰值加速度 **0.075 rad/s²** |
-| 不越 URDF 限位 | 稳态余量 ≥ 0.10 rad；运行期仍逐点校核 |
-| 当前 mesh 无碰撞 | pinocchio + hppfcl，排除父子/兄弟/夹爪对；运行期再抽查 400 个位形 |
-| 前两条左右镜像 | `amplitudes` 镜像（pitch 保号、roll/yaw 取反），相位相同 |
+| 默认轨迹 | `dyid_train_bimanual`，左右臂在同一时间窗运动 |
+| 运动时间 | **300 s**（插入的静止保持不消耗运动时间轴） |
+| 行程覆盖 | 14 个关节各 **≥80%**；现场 URDF 运行前再次硬校核 |
+| 频谱 | 基频 0.011 Hz；1～4 次谐波权重 `1.00/0.35/0.15/0.05` |
+| 速度 | 各关节峰值 ≥0.05 rad/s；肩/肘 ≤0.2，腕 ≤0.4 rad/s |
+| 碰撞 | 固定相位将多关节极值错开；运行前对 300 s 轨迹检查 6001 个位形 |
+| 下发 | 默认 200 Hz；每帧覆盖全部 14 个关节 |
 
-**关键设计：`center` 在运行期才决定。** YAML 里存的是相对起始姿态的 `bias`：
+`peak_normalize` 按每个关节一个完整基频周期的最小值/最大值把波形精确映射到
+`[-1,+1]`。因此 YAML 的 `amplitudes` 是实际半行程，`0.4 × (upper-lower)`
+对应 80% 峰峰值覆盖。工作点取 URDF 限位中点，进入段用 smoothstep 从实测姿态
+平滑过渡；运行期仍逐拍钳位，并要求 `clamp_count == 0`。
 
+默认配置就是交付的大幅版本，没有额外的标准档、左右单臂档或小幅训练轨迹。
+唯一保留的小幅运动是正式采集前逐关节 8.6° 的通路检查。
+
+### 离线校核
+
+```bash
+ros2 run lite_dyid dyid_design --generate \
+    /tmp/trajectories.yaml
+
+ros2 run lite_dyid dyid_design --check --urdf <展开后的 urdf> \
+    --trajectories /tmp/trajectories.yaml
 ```
-center_j = clip(entry_j + bias_j,  lo_j + |amp_j| + margin,  hi_j − |amp_j| − margin)
-```
-
-因为每次上电姿态不同，而且本机左肩 roll 停在 −89.3°（下限 −90°，只剩 0.7° 余量）。
-`|amp| = 0` 的关节（不激励的那条臂）**严格**保持在 `entry`。
-进入段用 smoothstep 从实测起始姿态过渡，斜坡时长按 `speed_cap` 反算。
 
 ---
 
@@ -196,7 +201,7 @@ center_j = clip(entry_j + bias_j,  lo_j + |amp_j| + margin,  hi_j − |amp_j| �
 **求解阶段**（不是采集阶段）会先对 `cmd / q / v / tau` 做**零相位** Butterworth 低通。
 零相位很重要：有相位延迟的话 `τ` 与 `q` 会对不齐，辨识会被"时间错位"污染。
 
-为什么是 0.2 Hz：本轨迹成分 = 基频 0.035 Hz 的 1/2/3/4 次谐波，最高 **0.14 Hz**，
+为什么是 0.2 Hz：本轨迹成分 = 基频 0.011 Hz 的 1/2/3/4 次谐波，最高 **0.044 Hz**，
 0.2 Hz 是"能保住运动本身"的最低带宽；再低就开始削信号而不是噪声。
 
 > ⚠️ **验证时必须用同一带宽**（`dyid_validate --lpf` 与辨识一致），否则模型在滤波
@@ -294,7 +299,7 @@ ros2 run lite_dyid dyid_validate --run-dir <采集目录> --with-inertia   # 四
 **为什么没用**（两点都能量化）：
 
 1. **惯量项本身极小**：RMS **0.029 N·m**，只有残差（0.179 N·m）的 **16%** ——
-   0.13 rad/s、0.075 rad/s² 的工况下 `τ = I·q̈` 本来就没多大；
+   这是旧版小幅轨迹数据；当前 80% 交付轨迹需要重新采集后再评估；
 2. **惯性回归严重欠定**：108 个未知量、数值秩只有 62、条件数 ~4e29。
    它会把训练集里别的未建模效应（摩擦非线性、重力模型误差）**吸收进惯量参数**，
    换一条轨迹就不成立（典型过拟合：训练集降、验证集升）。
@@ -319,9 +324,9 @@ run_YYYYmmdd_HHMMSS/
 ├── small_check.csv            小幅验证逐关节结果
 ├── statics.csv                静力学（**平均后**）：每个静止段一行
 ├── statics_raw_<traj>.csv     静止段原始样本（排查用）
-├── dynamics.csv               两条训练轨迹的运动段原始样本
+├── dynamics.csv               双臂同步训练轨迹的运动段原始样本
 ├── dynamics_<traj>.csv        分轨迹版本
-├── params.json                辨识结果（重力 + 摩擦；开了 --with-inertia 才有 inertia）
+├── params.json                辨识结果（**schema 2**，见 §7.1）
 ├── train_gravity_fit.png      静止样本：实测 vs 计算
 ├── train_friction.png         摩擦参数柱状图
 └── validation/                （答 y 才有）
@@ -335,12 +340,52 @@ CSV 列：`statics.csv` = `traj, static_index, motion_t, n_samples, duration_sec
 `dynamics.csv` = `traj, motion_t, wall_t, cmd/<j>×14, q/<j>×14, v/<j>×14, tau/<j>×14`。
 单位 rad / rad/s / N·m。读取时列数不匹配会**直接报错**（错位会让数值看着合理却对应错关节）。
 
+### 7.1 `params.json` 格式（schema 2）
+
+```jsonc
+{
+  "schema": 2,
+  "source": { "package": "lite_dyid", "model": "static_friction_only", "model_desc": "…" },
+  "robot":  { "urdf_sha256": "…", "joints": [14 个关节，顺序 = canonical], "links": [...] },
+  "inertia": {
+    "mode": "static_friction_only",        // ★ 用的是哪个辨识模型
+    "mode_desc": "静态+摩擦（惯量张量全部置 0；质量与一阶矩来自静态辨识）",
+    "usable_for_mass_matrix": false,       // ★ 下游据此 fail-closed：false = 不许算 M(q)
+    "links": {
+      "left_elbow_pitch": {
+        "identified": ["mass","mx","my","mz"],
+        "mass": 0.605986,                  // null = 不可辨识（下游取 1.0）
+        "com":  [0.232410, 0.283940, -0.271983],
+        "I":    [[0,0,0],[0,0,0],[0,0,0]]  // ★ 静态+摩擦时**全 0**
+      }
+    }
+  },
+  "joints": [...], "links": [...],          // ↓ 以下与 schema 1 **完全一致**（向后兼容）
+  "gravity": { "params": [...], "masses": [...], "coms": [...], "rank": …, "cond": … },
+  "friction": { "c1_pos": [...], "c1_neg": [...], "c2": [...] },
+  "fit": { "gravity_rms_joint": [...], "friction_rms_joint": [...], "scale_check": … },
+  "meta": { "model": "static_friction_only", "rate_hz": 200.0, "trajectories": [...] }
+}
+```
+
+**三条必须守住的语义**（都有单测 `test/test_schema2.py` 钉住）：
+
+| # | 语义 | 为什么 |
+|---|---|---|
+| 1 | `static_friction_only` 时 **`I` 全写 0** | 惯量根本没辨识，填任何"看起来合理"的值都是编造 |
+| 2 | 但 **`mass` 与 `com` 必须保留** | 重力矩 `τ_g = Σ Jᵀ(m·g)` 全靠它；置 0 ⇒ `g(q)≡0` ⇒ 前馈完全失效 |
+| 3 | **必须注明 `mode`**，并给出 `usable_for_mass_matrix` | 下游（`lite_move_controller` 的导纳/阻抗）能 **fail-closed** 地拒绝"需要 M(q) 但没有惯性"的用法，而不是静默退化 |
+
+> ⚠️ `--with-inertia` 时 `usable_for_mass_matrix=true`，但逐分量**仍非唯一**
+> （数值秩 < 参数个数），所以 `I` 的正确用法是"整体写回模型后用 `rnea`"，
+> 而不是单独解读某个 `Ixx`。原始拟合量放在 `inertia.raw_fit` 里备查。
+
 ---
 
 ## 8. 代码结构
 
 ```
-src/dyid/
+src/lite_dyid/
 ├── lite_dyid/
 │   ├── common.py        常量（关节表、话题、模式、镜像符号）
 │   ├── model.py         URDF → pinocchio：限位、碰撞对、重力回归基
@@ -351,13 +396,13 @@ src/dyid/
 │   ├── fastsolve.py     **快速内核**：单遍滤波 + 流式法方程 + fork 并行
 │   ├── collect.py       主流程（预检 → 采集 → 解算 → 询问）
 │   ├── identify.py      重力 + 摩擦辨识 + 离线 CLI
-│   ├── validate.py      第三条轨迹残差
+│   ├── validate.py      可选外部验证数据的残差
 │   ├── report.py        可视化（Agg，字体，缓存目录自动回退）
 │   └── design.py        轨迹设计/校核工具
-├── config/              dyid.yaml（默认参数）、trajectories.yaml（3 条轨迹）
+├── config/              dyid.yaml（默认参数）、trajectories.yaml（唯一交付轨迹）
 ├── launch/dyid.launch.py
 ├── docs/RUNBOOK.md      手动调试手册（上机前检查、故障排查、结果判读）
-└── test/                47 个单测（**不需要真机**）
+└── test/                离线单测（**不需要真机**）
 ```
 
 ---
@@ -366,11 +411,11 @@ src/dyid/
 
 ```bash
 colcon test --packages-select lite_dyid          # 或
-PYTHONPATH=src/dyid:$PYTHONPATH python3 -m pytest src/dyid/test -q
+PYTHONPATH=src/lite_dyid:$PYTHONPATH python3 -m pytest src/lite_dyid/test -q
 ```
 
-覆盖：轨迹限位/速度/肩部幅度、未激励关节严格不动、进入段无阶跃、斜坡时长、
-镜像一致性、静止段时刻表；重力回归精确复现力矩、质量非负约束、摩擦系数恢复、
+覆盖：14 关节至少 80% 行程、速度上下限、双臂同步、进入段无阶跃、
+镜像一致性、静止段时刻表；MIT 启动拒绝和 CSP 模式回读；重力回归、摩擦系数恢复、
 CSV 列数校验；**`fork_map` 并行顺序（回归测试）**、零相位滤波、法方程与旧求解器等价。
 
 ---
@@ -379,6 +424,7 @@ CSV 列数校验；**`fork_map` 并行顺序（回归测试）**、零相位滤�
 
 | 风险 | 行为 |
 |---|---|
+| 启动时仍是 MIT | 在第一帧位置命令前停止，打印 CSP bringup 重启参数 |
 | 目标越限 | 运行期逐点校核；构造轨迹时就拒绝振幅容不下的关节 |
 | 碰撞 | 设计期 + 运行期双重 mesh 检查，命中就拒绝执行 |
 | 命令没到电机 | 小幅验证逐关节确认"实动 ≥ 50% 命令幅度"，不通过**立即中止** |

@@ -26,8 +26,7 @@
     τ_fric(v) = c1⁺ (v>0)  /  c1⁻ (v<0)  +  c2 · v
 
 即 **库仑项分速度符号、粘滞项共用一个 c2**。逐关节线性最小二乘（3 个参数）。
-本阶段不引入惯性项 —— 轨迹设计上峰值速度 0.13 rad/s、峰值加速度 0.075 rad/s²，
-准静态假设成立；残差里若出现明显的惯性特征，会在验证图上看得见。
+默认模型不引入惯性项；需要惯量张量时显式使用 ``--with-inertia``。
 """
 
 from __future__ import annotations
@@ -62,6 +61,9 @@ class GravityResult:
     corr_joint: np.ndarray           # (n_joints,) 实测/预测相关系数
     prior_source: str = ""
     joints: List[str] = field(default_factory=lambda: list(ARM_JOINTS))
+    #: 这条结果来自哪个辨识模型（写进 schema2 的 inertia.mode）。
+    #: 取值见 MODEL_KINDS；默认"静态+摩擦"（= 惯量张量置 0）。
+    model_kind: str = "static_friction_only"
 
     @property
     def fit_rms(self) -> float:
@@ -261,6 +263,8 @@ def identify_fast(model, urdf_text: str, statics: Table, dynamics_path,
     from . import fastsolve
 
     grav = identify_gravity(model, statics, method="bounded", ridge=1e-6)
+    grav.model_kind = ("static_friction_inertia" if with_inertia
+                       else "static_friction_only")
     fit = fastsolve.fit(model, urdf_text, statics, Path(dynamics_path),
                         pi_grav=grav.params, lpf_hz=lpf_hz, workers=workers,
                         ridge=ridge, accel=accel, guard_sec=guard_sec,
@@ -286,11 +290,122 @@ def identify_fast(model, urdf_text: str, statics: Table, dynamics_path,
 # 保存 / 载入 / 命令行
 # ---------------------------------------------------------------------------
 
+#: 参数文件格式版本。
+#:   schema 1 —— 历史格式：只有 gravity/friction/fit/meta（**保留兼容**）
+#:   schema 2 —— 新增 robot（URDF 哈希 + 关节顺序）、inertia（逐连杆惯性）、
+#:               validation（四模型对比）；并**显式标注用的是哪个辨识模型**
+SCHEMA_VERSION = 2
+
+#: 辨识模型标识 → 人类可读说明（写进 params.json，供下游判断"能不能用惯性项"）
+MODEL_KINDS = {
+    "static_friction_only": "静态+摩擦（**惯量张量全部置 0**；质量与一阶矩来自静态辨识）",
+    "static_friction_inertia": "静态+摩擦+惯性（惯量张量来自动力学回归，数值秩 < 参数个数，非唯一）",
+    "static_inertia": "静态+惯性（无摩擦；一般不用）",
+    "static_only": "仅静态（重力）",
+}
+
+
+def _urdf_digest(urdf_text: Optional[str]) -> Optional[str]:
+    if not urdf_text:
+        return None
+    import hashlib
+    return hashlib.sha256(urdf_text.encode("utf-8")).hexdigest()
+
+
+def _inertia_section(grav: GravityResult, model_kind: str,
+                     fit: Optional[dict]) -> dict:
+    """构造 schema2 的 ``inertia`` 段。
+
+    ⚠️ 用户第 3 条要求（务必保持）：
+      · ``static_friction_only`` 时 **惯量张量写 0**；
+      · 但 **质量与质心必须保留**（重力矩 τ_g = Σ Jᵀ(m·g) 全靠它，
+        置 0 会让 g(q)≡0、前馈完全失效）；
+      · 并**注明用的是哪个辨识模型**（``mode`` + ``mode_desc``）—— 让下游能
+        fail-closed 地拒绝"需要 M(q) 但只有静态参数"的用法（导纳惯性整形等）。
+
+    ``links`` 按**连杆名**索引（绝不按下标：JSON/YAML 的键会重新排序）。
+    ``identified`` 标出哪些分量是数据真正定出来的（其余是正则/边界给的）。
+    """
+    zero_I = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    with_inertia = (model_kind == "static_friction_inertia"
+                    and fit is not None and "pi_I" in (fit or {}))
+    links: dict = {}
+    for i, name in enumerate(grav.link_names):
+        m = float(grav.masses[i])
+        com = [float(x) for x in grav.coms[i]]
+        identified = ["mass", "mx", "my", "mz"]
+        if abs(m) <= 1e-6:
+            # 质量不可辨识（例如肩 pitch 连杆原点固定在基座上）：
+            # 取 mass=1.0、com=first_moment/1.0 —— 与 GravityCompensator 同一条铁律
+            m_out: Optional[float] = None
+            com_out = [float(x) for x in grav.params.reshape(-1, 4)[i, 1:4]]
+            identified = ["mx", "my", "mz"]
+        else:
+            m_out = m
+            com_out = com
+        links[name] = {
+            "identified": identified,
+            "mass": m_out,                 # None = 不可辨识（下游取 1.0，见上）
+            "com": com_out if m_out is None else com,
+            "I": zero_I if not with_inertia else None,   # 有惯性时在下面用 pi_I 填
+        }
+    if with_inertia:
+        pi_I = np.asarray((fit or {}).get("pi_I"), dtype=float)
+        # 每个关节 6 个独立分量（对称张量的 6 个自由度），共 6·n_links 个
+        nl = len(grav.link_names)
+        if pi_I.size == 6 * nl:
+            for i, name in enumerate(grav.link_names):
+                a, b, c, d, e, f = (float(x) for x in pi_I[6 * i:6 * i + 6])
+                links[name]["I"] = [[a, b, c], [b, d, e], [c, e, f]]
+        else:
+            # 形状不符：不猜，置 0 并在段里标注（下游会 fail-closed）
+            for name in links:
+                links[name]["I"] = zero_I
+    return {
+        "mode": model_kind,
+        "mode_desc": MODEL_KINDS.get(model_kind, model_kind),
+        # ⚠️ 显式写给下游看的判据：true 才允许用它算 M(q) / 惯性整形
+        "usable_for_mass_matrix": bool(with_inertia),
+        "note": ("惯量张量已置 0（未辨识）；质量与一阶矩保留，g(q) 仍然准确"
+                 if not with_inertia else
+                 "惯量分量来自动力学回归；数值秩小于参数个数 ⇒ 逐分量**非唯一**，"
+                 "请整体写回模型后用 rnea 使用，不要单独解读 Ixx"),
+        "links": links,
+    }
+
+
 def save_params(path: Path, grav: GravityResult, fric: FrictionResult,
                 meta: Optional[dict] = None,
-                extra: Optional[dict] = None) -> None:
+                extra: Optional[dict] = None,
+                *, urdf_text: Optional[str] = None,
+                model_kind: Optional[str] = None,
+                fit: Optional[dict] = None) -> None:
+    """写 ``params.json``（**schema 2**）。
+
+    ⚠️ **向后兼容**：``joints`` / ``gravity`` / ``friction`` / ``fit`` / ``meta``
+    五个键的语义与 schema 1 **完全一致**，历史读取方（含
+    ``lite_controller/config/gravity/inertia_params.yaml`` 的生成脚本）不受影响；
+    schema 2 只是**新增** ``schema`` / ``source`` / ``robot`` / ``inertia`` /
+    ``validation`` 五个键。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    kind = model_kind or getattr(grav, "model_kind", None) or "static_friction_only"
     payload = {
+        # ---- schema2 新增 -------------------------------------------------
+        "schema": SCHEMA_VERSION,
+        "source": {
+            "package": "lite_dyid",
+            "model": kind,
+            "model_desc": MODEL_KINDS.get(kind, kind),
+            "generated": _now_iso(),
+        },
+        "robot": {
+            "urdf_sha256": _urdf_digest(urdf_text),
+            "joints": list(ARM_JOINTS),
+            "links": list(grav.link_names),
+        },
+        "inertia": _inertia_section(grav, kind, fit),
+        # ---- 与 schema 1 完全一致的兼容段 ----------------------------------
         "joints": list(ARM_JOINTS),
         "links": grav.link_names,
         "gravity": {
@@ -312,11 +427,29 @@ def save_params(path: Path, grav: GravityResult, fric: FrictionResult,
             "friction_rms_joint": fric.resid_rms_joint.tolist(),
             "scale_check": grav.scale_check,
         },
-        "meta": meta or {},
+        "meta": {**(meta or {}), "model": kind},
     }
-    if extra:
-        payload.update(extra)          # 例如 {"inertia": {...}}（向后兼容）
+    # ⚠️⚠️ 合并 `extra` 时**必须**把 ``inertia`` 拆出来单独处理。
+    #     历史上 extra["inertia"] 的语义是"整个 inertia 段"（旧格式：只有
+    #     pi_I/pi_ID/rank_I/n_train）。若直接 `payload.update(extra)`，
+    #     它会**整个替换**掉 schema2 刚构造好的 inertia 段 ——
+    #     mode / links / usable_for_mass_matrix 全部消失（实测踩过）。
+    #     正确做法：把旧格式的**原始拟合量**塞进新段的子键 ``raw_fit``。
+    extra_clean = dict(extra or {})
+    legacy_inertia = extra_clean.pop("inertia", None)
+    if extra_clean:
+        payload.update(extra_clean)
+    if legacy_inertia:
+        payload["inertia"]["raw_fit"] = dict(legacy_inertia)
+        # 保留 rank_I 在顶层子键里方便直接读（不覆盖 mode/links）
+        if "rank_I" in legacy_inertia:
+            payload["inertia"]["rank_I"] = int(legacy_inertia["rank_I"])
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def load_params(path: Path) -> dict:
@@ -422,6 +555,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       "accel": args.accel, "fast": not args.legacy,
                       "model": ("static+friction+inertia" if args.with_inertia
                                 else "static+friction")},
+                urdf_text=urdf_text,
+                model_kind=grav.model_kind,
+                fit=fit,
                 extra=None if (fit is None or "pi_I" not in fit) else {
                     "inertia": {"pi_I": np.asarray(fit["pi_I"]).tolist(),
                                 "pi_ID": np.asarray(fit["pi_ID"]).tolist(),

@@ -5,7 +5,7 @@
   <version>0.1.0</version>
   <description>
     Lite 双臂动力学辨识（CSP 位置模式）：
-    傅里叶激励轨迹 + 插入静止段 → 重力(质量/质心)辨识 → 摩擦(c1±,c2)辨识 → 第三条轨迹验证与残差可视化。
+    双臂同步 80% 行程傅里叶激励 + 插入静止段 → 重力(质量/质心)与摩擦(c1±,c2)辨识。
     本包**只当数据源**，不改动 lite_bridge / lite_controller / lite_driver。
   </description>
   <maintainer email="marki@example.com">marki</maintainer>

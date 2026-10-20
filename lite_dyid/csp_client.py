@@ -30,7 +30,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -44,6 +44,7 @@ from .common import (
     PROTOCOL_KEEP,
     SAFETY_FAULT,
     SRV_CLEAR_FAULT,
+    SRV_SET_SOURCE,
     SRV_GET_STATUS,
     SRV_SET_MODE,
     SRV_STANDBY,
@@ -79,7 +80,7 @@ class BridgeClient:
     ) -> None:
         import rclpy
         from rclpy.callback_groups import ReentrantCallbackGroup
-        from rclpy.executors import MultiThreadedExecutor
+        from rclpy.executors import SingleThreadedExecutor
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
         from robstride_msgs.msg import MotionCommand, SafetyStatus
         from robstride_msgs.srv import GetBridgeStatus, SetMode
@@ -128,8 +129,18 @@ class BridgeClient:
                                                     callback_group=self._cb_group)
         self._clear_fault_cli = self.node.create_client(Trigger, SRV_CLEAR_FAULT,
                                                         callback_group=self._cb_group)
+        # 释放数据源干预（采集收尾用：把控制权还回去）
+        from robstride_msgs.srv import SetSource
+        self._SetSource = SetSource
+        self._set_source_cli = self.node.create_client(SetSource, SRV_SET_SOURCE,
+                                                       callback_group=self._cb_group)
 
-        self._executor = MultiThreadedExecutor(num_threads=2)
+        # 一个后台执行器线程已经足够：订阅回调只复制最新状态，服务请求由
+        # 主线程发出后等待 future，响应仍由本线程处理。此前这里使用
+        # MultiThreadedExecutor(2)，真机实测其两个 Python worker 与 200 Hz
+        # 控制主线程争用 GIL：请求 200 Hz 实际仅约 115 Hz，最长断流 334 ms，
+        # CSP 控制器因此反复判命令陈旧。单线程执行器避免这类调度争用。
+        self._executor = SingleThreadedExecutor()
         self._executor.add_node(self.node)
         self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True,
                                              name="lite_dyid-exec")
@@ -269,46 +280,211 @@ class BridgeClient:
         from std_srvs.srv import Trigger
         return self._call(self._clear_fault_cli, Trigger.Request(), timeout, SRV_CLEAR_FAULT)
 
+    def lock_source(self, timeout: float = 10.0):
+        """**硬锁**本源（``SetSource{mode: LOCK, source: 自己}``）。
+
+        ⚠️ 为什么采集期必须锁：本包在采集时是一条**长达几分钟**的连续激励轨迹。
+        若不锁，桥的 ``SourceArbiter`` 只按"优先级 + 独占"裁定 —— 一旦有更高
+        优先级且 ``exclusive`` 的源（例如 ``llm``）突然发命令，控制权会被抢走：
+          · 本包仍在按轨迹下发，但命令被桥**丢弃**；
+          · 机械臂停在原地不动，而 ``dynamics.csv`` 里 ``cmd`` 还在变、``q`` 不动
+            → 数据里出现一段"命令与实测完全脱节"的样本，**静默污染辨识**。
+        锁源之后本源"只要在发命令就一直是它"，上述抢占不可能发生。
+        """
+        req = self._SetSource.Request()
+        req.mode = self._SetSource.Request.MODE_LOCK
+        req.source = str(self.source)
+        req.hold_ms = 0.0
+        return self._call(self._set_source_cli, req, timeout, SRV_SET_SOURCE)
+
+    def set_source_auto(self, timeout: float = 10.0):
+        """解除数据源干预，回到自动仲裁（``SetSource{mode: AUTO}``）。
+
+        ⚠️ 为什么采集收尾必须调它：本包通过 ``MotionCommand.source`` 声明自己是
+        ``dyid``；一旦停发，桥的 ``SourceArbiter`` 会因超时进 ``SAFE_HOLD``
+        并**保持**最后目标。把干预解除后控制权就干净地还回去，
+        操作员 / 其它源可以立刻接管，而不是卡在"dyid 还占着"的状态。
+        """
+        req = self._SetSource.Request()
+        req.mode = self._SetSource.Request.MODE_AUTO
+        req.source = ""
+        req.hold_ms = 0.0
+        return self._call(self._set_source_cli, req, timeout, SRV_SET_SOURCE)
+
+    # -- 收尾：先停发 → 回安全档 → 再交权 ---------------------------------
+
+    def finish_session(self, *, entered_tracking: bool,
+                       held_position: Optional[Sequence[float]] = None,
+                       settle_sec: float = 1.0) -> str:
+        """采集结束的**收尾序列**，返回人类可读的总结（供日志）。
+
+        顺序（每一步的理由都写在下面，**不要调换**）：
+
+          ① **停发** MotionCommand —— 先停发再动模式，避免"还在发旧目标、
+             同时又在切控制器"这种目标来源不唯一的状态。
+          ② 等 ``settle_sec``（默认 1.0 s）—— 让桥发现本源已失活并进 SAFE_HOLD。
+             桥的 ``source_timeouts_ms`` 默认 500 ms，命令自身的 ``timeout_ms``
+             是 300 ms，1.0 s 对两者都有余量。
+          ③ ``set_mode{CSP_HOLD}``（只在**真的进过 TRACKING** 时）——
+             把机械臂保持在当前目标。⚠️ 此时**不能**切 ``CSP_MONITOR(5)``：
+             CSP 没有"松劲"，切 5 会失能 → 机械臂自由落体。
+          ④ ``set_source{AUTO}`` —— 解除数据源干预，把控制权干净地还回去。
+             放在最后：它只影响仲裁，不影响"谁在写 loc_ref"。
+
+        ``held_position``：想把机械臂钉在某个位置时传入（默认不额外发帧）。
+        """
+        notes: List[str] = []
+
+        # ① 停发（销毁 publisher 会立刻停止出流；再显式打一条日志便于对时间线）
+        try:
+            if held_position is not None:
+                # 最后一帧：把目标钉在我们希望保持的位置上，再停发
+                self.publish_position(held_position)
+            self.node.destroy_publisher(self.pub)
+            notes.append("① 已停止下发 MotionCommand")
+        except Exception as exc:                       # 停发失败不致命
+            notes.append(f"① 停发时异常（忽略）：{exc}")
+
+        # ② 等桥侧超时
+        time.sleep(max(0.0, float(settle_sec)))
+        notes.append(f"② 已等待 {settle_sec:.1f}s（桥侧判本源失活 → SAFE_HOLD）")
+
+        # ③ 回安全档
+        if entered_tracking:
+            try:
+                res = self.set_mode(PROTOCOL_KEEP, CSP_HOLD, timeout=15.0)
+                ok = getattr(res, "ok", None)
+                notes.append(
+                    f"③ set_mode(CSP_HOLD) ok={ok} "
+                    f"actual_mode={getattr(res, 'actual_mode', '?')}"
+                    f"（{getattr(res, 'actual_mode_name', '')}）")
+            except Exception as exc:
+                notes.append(f"③ 切 CSP_HOLD 失败：{exc}（机械臂仍由桥 SAFE_HOLD 顶着）")
+        else:
+            notes.append("③ 未进入过 TRACKING（电机未使能）→ 不切模式，保持原状")
+
+        # ④ 交权
+        try:
+            res = self.set_source_auto(timeout=10.0)
+            ok = getattr(res, "ok", None)
+            notes.append(f"④ set_source(AUTO) ok={ok} "
+                         f"active_source='{getattr(res, 'active_source', '')}' "
+                         f"state={getattr(res, 'arbitration_state_name', '')}")
+        except Exception as exc:
+            notes.append(f"④ 解除数据源干预失败：{exc}（可手动 "
+                         f"ros2 service call {SRV_SET_SOURCE} "
+                         f"robstride_msgs/srv/SetSource \"{{mode: 0}}\"）")
+
+        return "；".join(notes)
+
     # -- 模式：确保 CSP + TRACKING ---------------------------------------
 
     def ensure_csp_ready(self, *, force_enter_tracking: bool = True) -> str:
-        """检查协议 → 必要时切入 CSP → 6(CSP_HOLD) → 7(CSP_TRACKING)。
+        """在任何位置命令发出前确认 CSP，并进入 HOLD → TRACKING。
 
         返回一段人类可读的说明（用于日志）。
-        跨协议切换不可在运行期完成 —— 桥会返回 restart_required，这里据此报错。
+        MIT/CSP 是驱动启动期协议，运行期不能跨协议切换；检测到 MIT 时本方法
+        直接失败并给出重启参数，绝不会继续发布 CSP 位置命令。
         """
         st = self.get_status()
+        if not getattr(st, "ok", False):
+            raise DyidError(f"读取桥状态失败：{getattr(st, 'message', '')}")
         notes = [f"当前：protocol={st.protocol_name} mode={st.mode_name}({st.mode}) "
                  f"controller={st.active_controller}[{'active' if st.controller_active else 'inactive'}]"]
 
         if st.protocol != PROTOCOL_CSP:
-            notes.append(f"协议是 {st.protocol_name}，尝试切到 CSP")
-            res = self.set_mode(PROTOCOL_CSP, CSP_MONITOR, force=False)
-            if res.restart_required or not res.ok:
-                raise DyidError(
-                    "当前 bringup 不是 CSP 组，运行期**不能**跨协议切换。请用下面的参数重启：\n"
-                    f"    {res.required_launch_args or 'controller:=csp control_mode:=csp'}\n"
-                    f"    桥的回复：{res.message}"
-                )
-            notes.append(f"已切到 {res.actual_protocol_name} / {res.actual_mode_name}")
-            st = self.get_status()
+            raise DyidError(
+                f"启动检查检测到 protocol={st.protocol_name}、mode={st.mode_name}。"
+                "当前底层不是 CSP；MIT/CSP 由驱动启动参数决定，运行期不能切换，"
+                "本次不会下发任何 CSP 位置命令。请停止当前 bringup 后用以下参数重启：\n"
+                f"    controller:=csp control_mode:=csp source_names:={self.source}\n"
+                "重启后先确认 /lite_bridge/get_status 返回 protocol=csp，再重新运行 dyid_collect。"
+            )
 
-        if not st.csp_monitor_loaded or not st.csp_tracking_loaded:
+        if not (st.csp_monitor_loaded and st.csp_hold_loaded and st.csp_tracking_loaded):
             raise DyidError("CSP 控制器未全部加载（需要 csp_monitor / csp_hold / csp_tracking）")
 
-        if st.mode == CSP_MONITOR:
+        # 无论启动时停在 MONITOR、HOLD 还是旧任务留下的 TRACKING，都先落到
+        # CSP_HOLD。这样新任务接管时有一个已回读的静止中间态，不会沿用旧源目标。
+        if st.mode != CSP_HOLD or not st.controller_active:
             res = self.set_mode(PROTOCOL_KEEP, CSP_HOLD)
-            if not res.ok:
-                raise DyidError(f"切 CSP_HOLD 失败：{res.message}")
-            notes.append("已进 CSP_HOLD（使能，锁在进档姿态）")
+            if (not getattr(res, "ok", False)
+                    or getattr(res, "actual_protocol", None) != PROTOCOL_CSP
+                    or getattr(res, "actual_mode", None) != CSP_HOLD
+                    or not getattr(res, "controller_active", False)):
+                raise DyidError(
+                    "切 CSP_HOLD 后回读不一致："
+                    f"ok={getattr(res, 'ok', False)} "
+                    f"protocol={getattr(res, 'actual_protocol_name', '?')} "
+                    f"mode={getattr(res, 'actual_mode_name', '?')} "
+                    f"controller_active={getattr(res, 'controller_active', False)}；"
+                    f"桥的回复：{getattr(res, 'message', '')}")
+            notes.append("已切 CSP_HOLD 并回读控制器 active（锁在当前姿态）")
+        else:
+            notes.append("启动时已在 CSP_HOLD，控制器 active")
+
+        # 在 HOLD 中先用"当前实测姿态"给本源保鲜。桥的第一帧只负责把源记成
+        # online，仲裁 tick 后后续帧才会被授权；HOLD 控制器不会跟随这些帧，
+        # 所以机械臂仍静止。必须先保鲜再 LOCK：若对一个从未发过帧的源直接
+        # LOCK，桥会按设计进入 SAFE_HOLD；timeout_action=disable 时甚至会退到
+        # CSP_MONITOR，使紧接着的 TRACKING 迁移守卫失败。
+        q_hold = np.asarray(list(self.pose_dict().values()), dtype=float)
+        for _ in range(6):
+            self.publish_position(q_hold)
+            time.sleep(0.03)
+
+        # ★ 锁源：必须在进 TRACKING **之前**完成。
+        #   理由见 `lock_source`：不锁的话，采集途中被更高优先级源抢占会
+        #   **静默**污染 dynamics.csv（cmd 在变、q 不动）。
+        try:
+            lk = self.lock_source(timeout=10.0)
+            if not getattr(lk, "ok", False):
+                raise DyidError(
+                    f"锁源失败：{getattr(lk, 'message', '')}；"
+                    f"可用源：{list(getattr(lk, 'available_sources', []))}。"
+                    f"请确认 bringup 传了 source_names:=<本包 source>")
+            if not getattr(lk, "source_online", False):
+                raise DyidError(
+                    f"锁源后 '{self.source}' 仍不是 online；"
+                    "桥没有收到 HOLD 保鲜帧，拒绝进入 TRACKING")
+            if getattr(lk, "active_source", "") != self.source:
+                raise DyidError(
+                    f"锁源回读 active_source='{getattr(lk, 'active_source', '')}'，"
+                    f"期望 '{self.source}'")
+            notes.append(f"已锁定数据源 '{self.source}'（MODE_LOCK）")
+        except DyidError:
+            raise
+        except Exception as exc:
+            raise DyidError(f"锁源调用异常：{exc}")
 
         if force_enter_tracking:
             res = self.set_mode(PROTOCOL_KEEP, CSP_TRACKING)
-            if not res.ok:
-                raise DyidError(f"切 CSP_TRACKING 失败：{res.message}")
-            if str(res.actual_mode_name) != "CSP_TRACKING":
-                raise DyidError(f"模式回读不是 CSP_TRACKING，而是 {res.actual_mode_name}")
-            notes.append("已进 CSP_TRACKING（跟随命令）")
+            if (not getattr(res, "ok", False)
+                    or getattr(res, "actual_protocol", None) != PROTOCOL_CSP
+                    or getattr(res, "actual_mode", None) != CSP_TRACKING
+                    or not getattr(res, "controller_active", False)):
+                raise DyidError(
+                    "切 CSP_TRACKING 后回读不一致："
+                    f"ok={getattr(res, 'ok', False)} "
+                    f"protocol={getattr(res, 'actual_protocol_name', '?')} "
+                    f"mode={getattr(res, 'actual_mode_name', '?')} "
+                    f"controller_active={getattr(res, 'controller_active', False)}；"
+                    f"桥的回复：{getattr(res, 'message', '')}")
+
+            # 再独立查询一次，避免只相信 set_mode 的单次响应。这里通过后主流程
+            # 才会把 entered_tracking 置真、才允许小幅测试发布第一帧。
+            verify = self.get_status()
+            if (not getattr(verify, "ok", False)
+                    or verify.protocol != PROTOCOL_CSP
+                    or verify.mode != CSP_TRACKING
+                    or not verify.controller_active):
+                raise DyidError(
+                    "CSP_TRACKING 二次状态确认失败："
+                    f"protocol={getattr(verify, 'protocol_name', '?')} "
+                    f"mode={getattr(verify, 'mode_name', '?')} "
+                    f"controller={getattr(verify, 'active_controller', '?')} "
+                    f"active={getattr(verify, 'controller_active', False)}")
+            notes.append("已进 CSP_TRACKING，二次回读确认控制器 active")
         return "；".join(notes)
 
     def assert_healthy(self) -> None:

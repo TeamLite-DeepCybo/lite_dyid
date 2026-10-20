@@ -21,6 +21,35 @@ ARM_JOINTS: List[str] = [
 #: 左手 7 关节 → 右手镜像的**符号**（pitch 保号；roll / yaw 取反）
 MIRROR_SIGN = (1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0)
 
+# ---------------------------------------------------------------------------
+# 逐关节速度上限（大幅档用）
+# ---------------------------------------------------------------------------
+#: 肩部（含肘）峰值速度上限 rad/s。
+#: 实测：肩部质量/惯量最大，摆太快会让 CSP 位置环的跟随误差与堵转保护一起吃紧；
+#: 0.2 rad/s ≈ 11.5°/s，与额定力矩余量匹配。
+V_CAP_SHOULDER = 0.2
+#: 腕部峰值速度上限 rad/s。
+#: 腕部 3 关节行程小（wrist_roll 仅 ±40°）、惯量最小，可以摆到 0.4 rad/s。
+V_CAP_WRIST = 0.4
+
+
+def velocity_cap_of(joint: str) -> float:
+    """单个关节的峰值速度上限（rad/s）。
+
+    ⚠️ 分类依据是**关节在链上的位置**（shoulder/elbow = 大臂段，wrist = 小臂段），
+    不是名字里有没有 "wrist" 之外的任何约定。``*_gripper`` 不参与辨识，
+    返回腕部上限只是为了让调用方拿到一个有限值。
+    """
+    name = str(joint)
+    if "wrist" in name:
+        return V_CAP_WRIST
+    return V_CAP_SHOULDER
+
+
+def velocity_caps() -> List[float]:
+    """``ARM_JOINTS`` 顺序的逐关节速度上限（rad/s）。"""
+    return [velocity_cap_of(j) for j in ARM_JOINTS]
+
 LEFT_JOINTS = ARM_JOINTS[:7]
 RIGHT_JOINTS = ARM_JOINTS[7:]
 
@@ -49,6 +78,7 @@ SRV_SET_MODE = "/lite_bridge/set_mode"
 SRV_GET_STATUS = "/lite_bridge/get_status"
 SRV_STANDBY = "/lite_bridge/standby"
 SRV_CLEAR_FAULT = "/lite_bridge/clear_fault"
+SRV_SET_SOURCE = "/lite_bridge/set_source"   # 数据源干预（LOCK/HANDOVER/AUTO）
 
 #: MotionCommand.mode
 MODE_CSP = 0

@@ -1,8 +1,8 @@
 # Copyright (c) 2026
 # Licensed under the Apache License, Version 2.0
 
-"""主流程：预检 → 切入 CSP → 小幅运动验证 → 两条轨迹采集（含 20 段静止）
-→ 自动解算（重力 + 摩擦）→ 询问是否用第三条轨迹验证。
+"""主流程：预检 → 确认 CSP → 小幅运动验证 → 双臂同步 300 s 采集
+→ 自动解算（重力 + 摩擦）。
 
 设计取舍
 ========
@@ -10,7 +10,7 @@
   预检与小幅验证里（每关节 ≤ ``--small-delta``°，默认 8.6°，速度 0.1 rad/s）。
 * **中止时不切 mode5**：CSP 没有"松劲"，切到 5 会让机械臂自由落下。
   中止时只停止下发（控制器保持最后目标），并在日志里给出"要怎么松开"。
-* **CSV 用预分配缓冲**：200 s @100 Hz ≈ 2 万行，用 dict 累积会吃掉几十倍内存。
+* **CSV 用预分配缓冲**：300 s @200 Hz ≈ 6 万行，用 dict 累积会吃掉几十倍内存。
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ from .trajectory import FourierTrajectory, load_specs
 
 DEFAULTS = {
     "source": "dyid",
-    "publish_rate_hz": 100.0,
+    "publish_rate_hz": 200.0,
     "command_timeout_ms": 300.0,
     "speed_cap": 0.15,
     "return_speed": 0.12,
@@ -62,7 +62,7 @@ DEFAULTS = {
     "small_reach_ratio": 0.5,
     "small_tolerance_rad": 0.25,
     "ridge": 1e-6,
-    "collision_samples": 400,
+    "collision_samples": 6001,
     "lpf_hz": 0.2,       # 求解前对 cmd/q/v/tau 做零相位低通（0=不滤）
     "workers": 4,        # 并行进程数（fork+pipe；ROS 节点内如遇异常可设 1）
     "accel": "ref",      # 惯性回归用的加速度来源（仅 with_inertia 时用到）
@@ -168,8 +168,7 @@ class Collector:
             raise DyidError(f"轨迹 {spec.name} 自检未通过：{check.problems}")
         self._collision_check(traj)
 
-        # ⚠️ 用 `<=`：t=200 s 恰好等于轨迹时长，也必须算一段静止
-        #    （否则 20 个时刻会只剩 19 个 —— 实测踩过）。
+        # ⚠️ 用 `<=`：落在轨迹终点的静止段也必须保留。
         static_times = [t for t in spec.joint_static_times() if t <= traj.duration + 1e-9]
         n_static = len(static_times)
 
@@ -287,7 +286,7 @@ class Collector:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="dyid_collect",
-        description="lite_dyid 主流程：预检 → 切入 CSP → 小幅验证 → 采集 → 解算 → 询问验证",
+        description="lite_dyid 主流程：确认 CSP → 小幅验证 → 双臂 300 s 采集 → 解算",
     )
     p.add_argument("--output-dir", default=None, help="结果目录（默认 ~/.ros/lite_dyid/runs）")
     p.add_argument("--source", default=None, help="桥的数据源名（默认 dyid，需已授权）")
@@ -305,14 +304,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="额外辨识惯性项（模型 C/D）；默认只做静态+摩擦")
     p.add_argument("--small-delta", type=float, default=None, help="小幅验证单关节幅度 rad")
     p.add_argument("--skip-small-check", action="store_true", help="跳过小幅验证（不推荐）")
+    p.add_argument("--small-check-only", action="store_true",
+                   help="只完成 CSP 启动检查和逐关节小幅验证，不执行 80% 大幅轨迹")
     p.add_argument("--traj", default=None, help="只跑指定轨迹名（可多次用逗号分隔）")
-    p.add_argument("--auto-validate", action="store_true", help="采集后自动跑第三条轨迹验证")
+    p.add_argument("--auto-validate", action="store_true",
+                   help="若自定义 YAML 含 role=validate，采集后自动运行该验证轨迹")
     p.add_argument("--no-validate-prompt", action="store_true", help="不询问，直接结束")
     return p
 
 
 def ask_validate(args) -> bool:
-    """最终是否跑第三条轨迹验证。
+    """最终是否运行自定义 YAML 中可选的 ``role=validate`` 轨迹。
 
     三态：``--auto-validate`` 直接做；``--no-validate-prompt`` 直接不做；
     默认**在命令行问用户**（非交互 stdin 视为"不做"，不会挂住）。
@@ -324,7 +326,7 @@ def ask_validate(args) -> bool:
         print("\n[验证] --no-validate-prompt：不验证")
         return False
     try:
-        ans = input("\n是否用第三条轨迹进行验证？[y/N] ").strip().lower()
+        ans = input("\n是否运行自定义 role=validate 轨迹？[y/N] ").strip().lower()
     except EOFError:
         print("\n[验证] 无交互输入（stdin 关闭）：视为不验证")
         return False
@@ -344,6 +346,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if val is None or (isinstance(val, str) and not val.strip()):
             continue
         cfg[key] = val
+    # ⚠️ 下发频率**硬上限 200 Hz**（用户要求）。
+    #    为什么要有这道闸：采样点密度 = 下发频率（本包一个循环里既下发又记录），
+    #    频率越高点数越多、CAN 带宽与磁盘写入压力越大；实测 1 Mbit/s 总线在
+    #    14 台电机 × 500 Hz 下余量不足（会出现 TX_QUEUE_OVERRUN）。
+    #    200 Hz 是"点数翻倍"与"总线安全"的折中，且**不改变轨迹的时间-状态关系**
+    #    （q(t) 一模一样，只是采得更细）。
+    rate = float(cfg.get("publish_rate_hz", 200.0))
+    if rate > 200.0:
+        print(f"[dyid] publish_rate_hz={rate} > 200 → 已钳到 200 Hz（硬上限）")
+        cfg["publish_rate_hz"] = 200.0
+    if rate <= 0.0:
+        raise DyidError(f"publish_rate_hz 必须为正，得到 {rate}")
 
     out_root = Path(args.output_dir).expanduser() if args.output_dir else default_output_dir()
     out_dir = out_root / datetime.now().strftime("run_%Y%m%d_%H%M%S")
@@ -415,7 +429,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             from .report import write_stats_csv
             write_stats_csv(out_dir / "small_check.csv", small_rows)
 
-        # ---- 采集两条训练轨迹 ----
+        if args.small_check_only:
+            print("[dyid] --small-check-only：小幅验证完成，结束前保持当前位置并切回 CSP_HOLD")
+            ok = True
+            return 0
+
+        # ---- 采集训练轨迹（默认仅一条双臂同步 300 s 交付轨迹）----
         home = start_pose
         statics_all: List[np.ndarray] = []
         first = True
@@ -464,11 +483,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         save_params(out_dir / "params.json", grav, fric,
                     meta={"run_dir": str(out_dir), "ridge": float(cfg["ridge"]),
                           "lpf_hz": lpf, "workers": nw, "accel": str(cfg["accel"]),
-                          "fast": True},
-                    extra={"inertia": {"pi_I": np.asarray(fit["pi_I"]).tolist(),
-                                       "pi_ID": np.asarray(fit["pi_ID"]).tolist(),
-                                       "rank_I": int(fit["rank_I"]),
-                                       "n_train": int(fit["n_train"])}})
+                          "fast": True,
+                          "rate_hz": float(cfg["publish_rate_hz"]),
+                          "trajectories": [s.name for s in train_specs]},
+                    urdf_text=urdf,
+                    model_kind=grav.model_kind,
+                    fit=fit,
+                    # ⚠️ 只有 `--with-inertia` 的 fit 才含 pi_I/pi_ID/rank_I。
+                    #    默认「静态+摩擦」没有这些键 —— 无条件取键会在**采集完成之后**
+                    #    崩掉（KeyError: 'pi_I'），连 params.json 都写不出来。
+                    extra=None if (fit is None or "pi_I" not in fit) else {
+                        "inertia": {"pi_I": np.asarray(fit["pi_I"]).tolist(),
+                                    "pi_ID": np.asarray(fit["pi_ID"]).tolist(),
+                                    "rank_I": int(fit["rank_I"]),
+                                    "n_train": int(fit["n_train"])}})
         print(_summary(grav, fric))
         from . import report
         report.plot_training(out_dir, model, grav, fric)
@@ -486,7 +514,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   f"{out_dir}")
             return 0
 
-        # ---- 第三条轨迹验证 ----
+        # ---- 可选的自定义验证轨迹（默认交付 YAML 不包含）----
         vdir = out_dir / "validation"
         vdir.mkdir(exist_ok=True)
         spec = val_specs[0]
@@ -514,20 +542,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"\n❌ {exc}")
         return 2
     finally:
-        if entered_tracking:
-            # ⚠️ 只有在**真的进过 CSP_TRACKING**（= 电机已使能）时才收尾切 CSP_HOLD。
-            #    若预检阶段就失败（还停在 mode5 未使能），切 6 会**把电机使能起来** ——
-            #    那是在"什么都没做"的情况下凭空上电，绝不能发生。
-            try:
-                client.set_mode(PROTOCOL_KEEP, CSP_HOLD, timeout=15.0)
-                print("[dyid] 已切 CSP_HOLD：机械臂保持在当前目标（CSP 不会松劲）")
+        # =====================================================================
+        # 收尾序列：**先停发 → 回安全档 → 再交权**
+        # =====================================================================
+        #
+        # ⚠️ 顺序不可调换，理由见 `BridgeClient.finish_session` 的文档：
+        #   ① 先停发 MotionCommand（避免"还在发旧目标、同时又在切控制器"）；
+        #   ② 等桥侧判本源失活进 SAFE_HOLD（source_timeouts_ms 默认 500 ms）；
+        #   ③ set_mode(CSP_HOLD) 把机械臂保持在当前目标
+        #      ⚠️ **不能**切 CSP_MONITOR(5)：CSP 没有"松劲"，切 5 会失能 → 自由落体；
+        #   ④ set_source(AUTO) 把控制权干净地还回去。
+        #
+        # ⚠️ ③ 只在**真的进过 CSP_TRACKING**（= 电机已使能）时才做：
+        #    若预检阶段就失败（还停在 mode5 未使能），切 6 会**把电机使能起来** ——
+        #    那是在"什么都没做"的情况下凭空上电，绝不能发生。
+        try:
+            held = None
+            if entered_tracking:
+                cur = client.pose_dict()
+                if cur:
+                    held = np.asarray(list(cur.values()), dtype=float)
+            summary = client.finish_session(entered_tracking=entered_tracking,
+                                            held_position=held)
+            print(f"[dyid] 收尾：{summary}")
+            if entered_tracking:
                 print("       要松开：ros2 service call /lite_bridge/set_mode "
                       "robstride_msgs/srv/SetMode \"{protocol: 1, mode: 5, force: true}\""
                       "（注意支撑，电机将自由）")
-            except Exception as exc:
-                print(f"[dyid] 收尾切 CSP_HOLD 失败：{exc}")
-        else:
-            print("[dyid] 未进入 CSP_TRACKING，保持当前模式不变（未使能电机）")
+            else:
+                print("[dyid] 未进入 CSP_TRACKING，未使能电机（保持当前模式不变）")
+        except Exception as exc:                       # 收尾失败不影响退出码
+            print(f"[dyid] 收尾序列异常（已尽力）：{exc}")
+            if entered_tracking:
+                try:
+                    client.set_mode(PROTOCOL_KEEP, CSP_HOLD, timeout=15.0)
+                    print("[dyid] 兜底：已切 CSP_HOLD")
+                except Exception as exc2:
+                    print(f"[dyid] 兜底切 CSP_HOLD 也失败：{exc2}")
         client.shutdown()
         _ = ok
 

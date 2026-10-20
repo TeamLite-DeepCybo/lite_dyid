@@ -26,13 +26,15 @@ ARGS = {
     "ridge": ("", "重力辨识岭系数"),
     "small_delta": ("", "小幅验证单关节幅度 rad"),
     "skip_small_check": ("false", "跳过小幅运动验证（不推荐）"),
-    "auto_validate": ("false", "采集后自动跑第三条轨迹验证，不再询问"),
+    "small_check_only": ("false", "只运行 CSP 检查和小幅验证，不运行大幅轨迹"),
+    "auto_validate": ("false", "若自定义 YAML 含 role=validate，采集后自动运行它"),
     "no_validate_prompt": ("false", "不询问、也不验证"),
 }
 
 #: launch 名 → dyid_collect 的命令行开关
 FLAGS = {
     "skip_small_check": "--skip-small-check",
+    "small_check_only": "--small-check-only",
     "auto_validate": "--auto-validate",
     "no_validate_prompt": "--no-validate-prompt",
 }

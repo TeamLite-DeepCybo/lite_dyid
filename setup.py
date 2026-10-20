@@ -26,11 +26,11 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            # 主入口：预检 → 切入 CSP → 小幅验证 → 采集两条轨迹 → 自动解算 → 询问验证
+            # 主入口：确认 CSP → 小幅验证 → 双臂同步 300 s 采集 → 自动解算
             "dyid_collect = lite_dyid.collect:main",
             # 离线重解（只读 CSV，不碰机器人）
             "dyid_identify = lite_dyid.identify:main",
-            # 第三条轨迹验证（残差 + 可视化）
+            # 可选外部验证轨迹（残差 + 可视化；默认交付配置不含额外运动）
             "dyid_validate = lite_dyid.validate:main",
             # 轨迹设计/校核工具（限位 + 速度 + mesh 碰撞，不碰机器人）
             "dyid_design = lite_dyid.design:main",

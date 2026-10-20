@@ -1,117 +1,100 @@
 # Copyright (c) 2026
 # Licensed under the Apache License, Version 2.0
 
-"""轨迹层的单测：不依赖机器人，也不依赖 pinocchio。"""
+"""默认交付轨迹的离线回归测试。"""
 
 import numpy as np
 import pytest
 
-from lite_dyid.common import ARM_JOINTS, config_path
+from lite_dyid.common import (MIRROR_SIGN, config_path, velocity_caps)
+from lite_dyid.design import TRAJECTORY_NAME, build_specs
+from lite_dyid.limits_table import limits_array, midpoint
 from lite_dyid.trajectory import FourierTrajectory, load_specs
 
-#: 本机实测参考姿态（rad）
+
 REF_POSE = np.array([
     0.0564, -1.5582, 0.4550, -0.1300, 0.2127, 0.0625, -0.0307,
     0.0961, 1.5559, -0.1918, 0.1992, 0.7816, 0.0640, -0.1787,
 ])
 
-#: 与 URDF 一致的限位（rad）
-LIMITS = {
-    "left_shoulder_pitch": (-3.141592653589793, 0.7853981633974483),
-    "left_shoulder_roll": (-1.5707963267948966, 1.9198621771937625),
-    "left_shoulder_yaw": (-1.5707963267948966, 1.5707963267948966),
-    "left_elbow_pitch": (-2.356194490192345, 0.0),
-    "left_wrist_yaw": (-1.5707963267948966, 1.5707963267948966),
-    "left_wrist_roll": (-0.6981317007977318, 0.6981317007977318),
-    "left_wrist_pitch": (-0.7853981633974483, 0.7853981633974483),
-    "right_shoulder_pitch": (-3.141592653589793, 0.7853981633974483),
-    "right_shoulder_roll": (-1.9198621771937625, 1.5707963267948966),
-    "right_shoulder_yaw": (-1.5707963267948966, 1.5707963267948966),
-    "right_elbow_pitch": (0.0, 2.356194490192345),
-    "right_wrist_yaw": (-1.5707963267948966, 1.5707963267948966),
-    "right_wrist_roll": (-0.6981317007977318, 0.6981317007977318),
-    "right_wrist_pitch": (-0.7853981633974483, 0.7853981633974483),
-}
+
+def _spec():
+    specs = load_specs(config_path("trajectories.yaml"))
+    assert list(specs) == [TRAJECTORY_NAME]
+    return specs[TRAJECTORY_NAME]
 
 
-def _limits() -> tuple:
-    return (np.array([LIMITS[j][0] for j in ARM_JOINTS]),
-            np.array([LIMITS[j][1] for j in ARM_JOINTS]))
+def _trajectory(entry=REF_POSE):
+    lo, hi = limits_array()
+    return FourierTrajectory(_spec(), np.asarray(entry), (lo, hi),
+                             v_cap=np.asarray(velocity_caps()))
 
 
-def _specs():
-    return load_specs(config_path("trajectories.yaml"))
+def test_default_is_single_300_second_bimanual_train_trajectory():
+    spec = _spec()
+    assert spec.role == "train"
+    assert spec.duration_sec == pytest.approx(300.0)
+    assert np.all(np.abs(spec.amplitudes) > 0.0)
+    assert spec.min_coverage == pytest.approx(0.80)
 
 
-def test_config_has_three_roles():
-    specs = _specs()
-    roles = sorted(s.role for s in specs.values())
-    assert roles == ["train", "train", "validate"], roles
-    assert len(specs) == 3
+def test_low_frequency_harmonics_have_strictly_larger_amplitude():
+    weights = _spec().harmonic_weights
+    assert np.all(np.diff(weights) < 0.0)
+    assert weights.tolist() == pytest.approx([1.0, 0.35, 0.15, 0.05])
 
 
-@pytest.mark.parametrize("name", ["dyid_train_left", "dyid_train_right", "dyid_validate"])
-def test_trajectory_respects_limits_speed_and_shoulder(name):
-    spec = _specs()[name]
-    traj = FourierTrajectory(spec, REF_POSE, _limits(), speed_cap=0.15)
-    chk = traj.check(samples=3000)
-    assert chk.ok, chk.problems
-    lo, hi = _limits()
-    # 稳态（t >= ramp）必须留在限位内且有余量
-    for k in range(len(ARM_JOINTS)):
-        if abs(spec.amplitudes[k]) < 1e-12:
-            continue
-        assert chk.q_min[k] >= lo[k] - 1e-9
-        assert chk.q_max[k] <= hi[k] + 1e-9
-    # 速度 ≈ 0.15 rad/s 水平
-    assert chk.v_peak.max() <= 0.20
-    assert chk.v_peak.max() >= 0.05
-    # 肩部单关节变动 ≤ 50°
-    for k, jn in enumerate(ARM_JOINTS):
-        if "shoulder" in jn and abs(spec.amplitudes[k]) > 1e-12:
-            assert chk.travel_deg[k] <= 50.0, (jn, chk.travel_deg[k])
+def test_effective_travel_is_at_least_80_percent_for_every_joint():
+    traj = _trajectory()
+    check = traj.check(samples=12000)
+    assert check.ok, check.problems
+    assert np.all(check.coverage >= 0.798)  # 密采峰值误差 < 0.2%
+    assert traj.clamp_count == 0
 
 
-def test_non_excited_joint_is_strictly_held():
-    """未激励的关节（另一条臂）必须**严格**留在起始姿态，不能被限位裁剪带跑。"""
-    specs = _specs()
-    for name, arm in (("dyid_train_left", slice(7, 14)), ("dyid_train_right", slice(0, 7))):
-        spec = specs[name]
-        traj = FourierTrajectory(spec, REF_POSE, _limits(), speed_cap=0.15)
-        for t in np.linspace(0.0, traj.duration, 200):
-            q, _ = traj.evaluate(float(t))
-            assert np.allclose(q[arm], REF_POSE[arm], atol=1e-12), (name, t)
+def test_every_joint_velocity_is_bounded_and_not_too_slow():
+    spec = _spec()
+    check = _trajectory().check(samples=12000)
+    caps = np.asarray(velocity_caps())
+    active = np.abs(spec.amplitudes) > 1e-12
+    assert np.all(check.v_peak[active] <= caps[active] + 1e-6)
+    assert np.all(check.v_peak[active] >= spec.min_peak_speed - 1e-6)
 
 
-def test_entry_blend_starts_at_entry_position():
-    """t=0 必须**恰好**等于起始姿态（否则第一步就是阶跃）。"""
-    spec = _specs()["dyid_train_left"]
-    traj = FourierTrajectory(spec, REF_POSE, _limits(), speed_cap=0.15)
-    q0, _ = traj.evaluate(0.0)
+def test_both_arms_move_in_the_same_time_window():
+    traj = _trajectory(midpoint())
+    moved_together = False
+    for t in np.linspace(traj.ramp, traj.duration, 500):
+        q, _ = traj.evaluate(float(t))
+        dq = np.abs(q - midpoint())
+        if np.max(dq[:7]) > 0.1 and np.max(dq[7:]) > 0.1:
+            moved_together = True
+            break
+    assert moved_together
+
+
+def test_right_arm_amplitudes_are_mirrored_from_left():
+    amp = _spec().amplitudes
+    assert np.allclose(amp[7:], amp[:7] * np.asarray(MIRROR_SIGN), atol=2e-6)
+
+
+def test_entry_blend_starts_exactly_at_measured_pose():
+    q0, v0 = _trajectory().evaluate(0.0)
     assert np.allclose(q0, REF_POSE, atol=1e-12)
+    assert np.allclose(v0, 0.0, atol=1e-12)
 
 
-def test_ramp_duration_respects_speed_cap():
-    spec = _specs()["dyid_train_left"]
-    traj = FourierTrajectory(spec, REF_POSE, _limits(), speed_cap=0.05)
-    travel = float(np.max(np.abs(traj.center - REF_POSE)))
-    assert traj.ramp >= 1.5 * travel / 0.05 - 1e-9
+def test_static_samples_cover_the_full_motion_timeline():
+    spec = _spec()
+    assert spec.joint_static_times() == [20.0 * k for k in range(1, 16)]
+    assert spec.static_hold_sec == pytest.approx(6.0)
+    assert spec.static_settle_sec == pytest.approx(3.0)
 
 
-def test_mirrored_pair_is_mirrored():
-    """前两条的幅值应左/右镜像（pitch 保号、roll/yaw 取反）。"""
-    specs = _specs()
-    l = specs["dyid_train_left"].amplitudes
-    r = specs["dyid_train_right"].amplitudes
-    sign = np.array([1, -1, -1, 1, -1, -1, 1], dtype=float)
-    assert np.allclose(l[:7], r[7:] * sign)
-    assert np.allclose(l[7:], 0.0)
-    assert np.allclose(r[:7], 0.0)
-
-
-def test_static_insert_times():
-    spec = _specs()["dyid_train_left"]
-    times = spec.joint_static_times()
-    assert len(times) == spec.static_insert_count == 20
-    assert times == [10.0 * k for k in range(1, 21)]
-    assert spec.static_hold_sec == 10.0
+def test_generator_and_checked_in_config_describe_same_trajectory():
+    generated = build_specs()["trajectories"][0]
+    spec = _spec()
+    assert generated["name"] == spec.name
+    assert generated["duration_sec"] == spec.duration_sec
+    assert generated["frequency_hz"] == spec.frequency_hz
+    assert generated["amplitudes"] == pytest.approx(spec.amplitudes.tolist())
