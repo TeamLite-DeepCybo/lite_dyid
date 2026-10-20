@@ -37,6 +37,16 @@ RAMP_SEC = 30.0
 AMPLITUDE_RATIO = 0.15  # 半行程；峰峰值为整个关节行程的 30%
 RETURN_SPEED = 0.10
 SETTLE_SEC = 2.0
+REQUIRED_ARTIFACTS = (
+    "validation_meta.json",
+    "tracking_without_identified_ff.csv",
+    "tracking_without_identified_ff.png",
+    "tracking_with_identified_ff.csv",
+    "tracking_with_identified_ff.png",
+    "tracking_error_stats.csv",
+    "tracking_error_comparison.png",
+    "summary.json",
+)
 
 # 两个频率的固定相位。右臂复用左臂相位，振幅按镜像符号翻转。
 _LEFT_PHASES = np.asarray([
@@ -76,6 +86,43 @@ def find_latest_run(run_dir: Optional[Path] = None) -> Path:
         roots_text = "、".join(str(p.expanduser()) for p in roots)
         raise DyidError(f"找不到最新辨识结果（搜索过 {roots_text}）；请传 --run-dir")
     return max(found, key=lambda p: (p / "params.json").stat().st_mtime)
+
+
+def choose_output_dir(run_dir: Path, requested: Optional[Path] = None,
+                      *, timestamp: Optional[str] = None) -> Path:
+    """选择持久输出目录；不再默认把验证结果跟随 ``/tmp`` 辨识目录存放。"""
+    if requested is not None:
+        return Path(requested).expanduser().resolve()
+    stamp = timestamp or datetime.now().strftime("tracking_validation_%Y%m%d_%H%M%S")
+    root = Path.home() / ".ros" / "lite_dyid" / "tracking_validations"
+    return (root / Path(run_dir).name / stamp).resolve()
+
+
+def verify_output_artifacts(out_dir: Path) -> dict:
+    """完成前逐项确认产物非空，并写 ``artifacts.json`` 清单。"""
+    out_dir = Path(out_dir).resolve()
+    missing = []
+    files = []
+    for name in REQUIRED_ARTIFACTS:
+        path = out_dir / name
+        if not path.is_file() or path.stat().st_size <= 0:
+            missing.append(name)
+            continue
+        files.append({"name": name, "bytes": path.stat().st_size,
+                      "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    if missing:
+        raise DyidError(f"输出完整性检查失败，缺少或为空：{missing}；目录：{out_dir}")
+    manifest = {
+        "verified": datetime.now().isoformat(timespec="seconds"),
+        "output_dir": str(out_dir),
+        "file_count": len(files),
+        "total_bytes": int(sum(item["bytes"] for item in files)),
+        "files": files,
+    }
+    temp = out_dir / ".artifacts.json.tmp"
+    temp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    temp.replace(out_dir / "artifacts.json")
+    return manifest
 
 
 def _sha256(text: str) -> str:
@@ -327,7 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-dir", default=None,
                         help="辨识结果目录；默认自动选择最新 params.json")
     parser.add_argument("--output-dir", default=None,
-                        help="输出目录；默认写到辨识结果下 tracking_validation_<时间>")
+                        help="输出目录；默认写到 ~/.ros/lite_dyid/tracking_validations/")
     parser.add_argument("--source", default="dyid", help="lite_bridge 已注册的数据源名")
     parser.add_argument("--duration", type=float, default=DURATION_SEC,
                         help=f"每组轨迹时长，默认 {DURATION_SEC:g}s")
@@ -392,8 +439,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         peak = np.max(np.abs(tau_identified), axis=0)
         print(f"[预检] 辨识前馈峰值 {peak.max():.3f}N·m，逐关节均未超过额定力矩")
 
-        out_dir = (Path(args.output_dir).expanduser() if args.output_dir else
-                   run_dir / datetime.now().strftime("tracking_validation_%Y%m%d_%H%M%S"))
+        out_dir = choose_output_dir(
+            run_dir, Path(args.output_dir) if args.output_dir else None)
         out_dir.mkdir(parents=True, exist_ok=False)
         (out_dir / "validation_meta.json").write_text(json.dumps({
             "created": datetime.now().isoformat(timespec="seconds"),
@@ -441,7 +488,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "mean_rmse_improvement_percent": float(np.mean(improvement)),
             "per_joint_rmse_improvement_percent": dict(zip(ARM_JOINTS, improvement.tolist())),
         }, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"\n[完成] 图像、原始数据与误差统计已写入：{out_dir}")
+        manifest = verify_output_artifacts(out_dir)
+        size_mib = manifest["total_bytes"] / (1024.0 * 1024.0)
+        print(f"\n[完成] 已验证 {manifest['file_count']} 个必需产物，共 {size_mib:.1f} MiB")
+        print(f"[完成] 持久输出目录：{manifest['output_dir']}")
+        print(f"[完成] 产物清单：{Path(manifest['output_dir']) / 'artifacts.json'}")
+        print(f"[完成] 查看命令：ls -lah '{manifest['output_dir']}'")
         return 0
     except ProtocolRestartRequired as exc:
         print(f"\n[需要重启 MIT bringup]\n{exc}", file=sys.stderr)

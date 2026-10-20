@@ -185,9 +185,12 @@ ros2 run lite_dyid dyid_tracking_validate \
     --run-dir /tmp/dyid_runs/run_YYYYmmdd_HHMMSS
 ```
 
-输出目录位于辨识结果下的 `tracking_validation_<时间>/`，包含两组原始 CSV、两张
-实际/期望关节角度图、逐关节误差对比图、`tracking_error_stats.csv` 和
-`summary.json`。运行前会校验 URDF 机械语义、限位、速度、mesh 碰撞和前馈额定力矩。
+默认输出目录为持久路径
+`~/.ros/lite_dyid/tracking_validations/<辨识运行名>/tracking_validation_<时间>/`；
+也可以用 `--output-dir` 明确指定。目录包含两组原始 CSV、两张实际/期望关节角度图、
+逐关节误差对比图、`tracking_error_stats.csv`、`summary.json` 和产物完整性清单
+`artifacts.json`。程序只有在全部必需文件存在且非空后才打印“完成”。运行前会校验
+URDF 机械语义、限位、速度、mesh 碰撞和前馈额定力矩。
 其中在线 URDF 采用 XML 语义校验：允许验证所必需的 `control_mode: csp→mit`
 变化及纯格式差异，关节、限位、传动、惯性或几何变化仍会拒绝。
 

@@ -1,5 +1,6 @@
 """MIT 跟踪验证的协议进入、轨迹定义与统计单测。"""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,7 +12,9 @@ from lite_dyid.csp_client import BridgeClient, ProtocolRestartRequired
 from lite_dyid.report import tracking_error_stats
 from lite_dyid.tracking_validate import (build_validation_trajectory,
                                          check_live_urdf_compatible,
-                                         find_latest_run, sample_reference)
+                                         choose_output_dir, find_latest_run,
+                                         sample_reference,
+                                         verify_output_artifacts)
 
 
 def _status(protocol, mode, *, active=True):
@@ -172,3 +175,28 @@ def test_live_urdf_ignores_xml_whitespace_only():
     assert "语义一致" in check_live_urdf_compatible(
         '<robot name="lite"><link name="base"/></robot>',
         '<robot name="lite">\n  <link name="base" />\n</robot>')
+
+
+def test_default_tracking_output_is_persistent_even_for_tmp_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    output = choose_output_dir(Path("/tmp/dyid_runs/run_1"), timestamp="tracking_validation_x")
+    assert str(output).startswith(str(tmp_path / "home" / ".ros" / "lite_dyid"))
+    assert output.name == "tracking_validation_x"
+    assert output.parent.name == "run_1"
+
+
+def test_explicit_output_dir_is_respected(tmp_path):
+    requested = tmp_path / "my_result"
+    assert choose_output_dir(Path("/tmp/run_1"), requested) == requested.resolve()
+
+
+def test_artifact_verification_fails_closed_then_writes_manifest(tmp_path):
+    from lite_dyid.tracking_validate import REQUIRED_ARTIFACTS
+
+    with pytest.raises(DyidError, match="输出完整性检查失败"):
+        verify_output_artifacts(tmp_path)
+    for index, name in enumerate(REQUIRED_ARTIFACTS):
+        (tmp_path / name).write_bytes(f"artifact-{index}".encode())
+    manifest = verify_output_artifacts(tmp_path)
+    assert manifest["file_count"] == len(REQUIRED_ARTIFACTS)
+    assert (tmp_path / "artifacts.json").is_file()
