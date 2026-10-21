@@ -122,7 +122,7 @@ run_<时间戳>/
 
 ```bash
 cp ~/.ros/lite_dyid/runs/run_<时间戳>/params.json \
-  <workspace>/src/lite_move_controller/config/dynamics/identified_params.json
+  <workspace>/src/Lite_move_controller/lite_move_controller/config/dynamics/identified_params.json
 
 cd <workspace>
 colcon build --packages-select lite_move_controller
